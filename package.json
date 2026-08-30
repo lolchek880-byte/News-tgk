@@ -1,0 +1,16 @@
+{
+  "name": "ai-news-bot",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "rss-parser": "^3.13.0"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
