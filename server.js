@@ -7,10 +7,10 @@ const path = require("path");
 const app = express();
 
 /* =========================================================
-   AI NEWS BOT v0.5.1
+   AI NEWS BOT v0.9.1
 ========================================================= */
 
-const VERSION = "0.5.1";
+const VERSION = "0.5.2";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
@@ -29,8 +29,23 @@ const TIMEZONE = "Europe/Moscow";
 /* Максимум 1 пост в минуту */
 const POST_INTERVAL_MS = 60 * 1000;
 
-/* Сохраняем только 2 последние новости каждого источника */
-const REMEMBER_PER_SOURCE = 2;
+/* Сколько последних новостей на источник храним для защиты от повторов.
+   Раньше было 2 — этого не хватало: как только по источнику выходило
+   больше 2 новых новостей между проверками, старые ссылки "забывались"
+   и бот публиковал их заново. Теперь храним намного больше и вдобавок
+   чистим по времени (см. POSTED_MAX_AGE_MS), а не только по количеству. */
+const REMEMBER_PER_SOURCE = 500;
+
+/* Сколько последних записей на источник используем для проверки похожести
+   заголовков (не всю историю — иначе будут случайные ложные совпадения) */
+const SIMILARITY_CHECK_WINDOW = 15;
+
+/* Как долго хранить историю опубликованного/пропущенного, чтобы файл
+   не рос бесконечно, но при этом реально защищал от повторов */
+const POSTED_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14 дней
+
+/* Не публиковать новости старше этого возраста (по дате из RSS) */
+const MAX_NEWS_AGE_MS = 60 * 60 * 1000; // 1 час
 
 /* Похожесть */
 const SIMILARITY_THRESHOLD = parseFloat(
@@ -550,7 +565,7 @@ function buildStatus() {
   }
 
   return (
-    `🤖 <b>AI NEWS BOT</b>\n\n` +
+    `🤖 <b>NEWS BOT</b>\n\n` +
     `🧩 Версия: <code>${VERSION}</code>\n` +
     `📤 Посты: ${posting}\n` +
     `📦 Очередь: <b>${publicationQueue.length}</b>\n` +
@@ -641,7 +656,7 @@ function buildSources() {
 
       `💾 Запомнено: ${
         remembered.length
-      } / ${REMEMBER_PER_SOURCE}\n` +
+      }\n` +
 
       `🕐 ${
         stats.lastCheck
@@ -1117,7 +1132,8 @@ function buildSettings() {
     `📡 Источников: ${FEEDS.length}\n` +
     `🔄 Проверка RSS: каждые ${CHECK_INTERVAL_MIN} мин.\n` +
     `📤 Публикация: 1 пост / 60 сек.\n` +
-    `💾 Запоминание: последние ${REMEMBER_PER_SOURCE} новости на источник\n` +
+    `💾 Память дублей: ${REMEMBER_PER_SOURCE} записей / источник, хранится ${Math.round(POSTED_MAX_AGE_MS / (24*60*60*1000))} дней\n` +
+    `🕐 Не публикуем новости старше: ${Math.round(MAX_NEWS_AGE_MS / 60000)} мин.\n` +
     `🧠 Модель: <code>openai/gpt-oss-120b</code>\n` +
     `🕐 Часовой пояс: <code>Europe/Moscow</code>\n` +
     `🛡 Похожесть: ${
@@ -1144,7 +1160,7 @@ async function sendVersion() {
         ADMIN_CHAT_ID,
 
       text:
-        `🧩 <b>ВЕРСИЯ AI NEWS BOT</b>\n\n` +
+        `🧩 <b>ВЕРСИЯ NEWS BOT</b>\n\n` +
         `🚀 Сейчас запущена:\n` +
         `<code>v${VERSION}</code>\n\n` +
 
@@ -1205,9 +1221,7 @@ function buildPost({
       source.color
     } <b>${escapeHTML(
       source.name
-    )}</b>\n` +
-
-    `🤖 <b>AI News</b>`
+    )}</b>`
   );
 }
 
@@ -1216,7 +1230,8 @@ function buildPost({
 ========================================================= */
 
 const EDITOR_PROMPT = `
-Ты профессиональный редактор Telegram-новостного канала.
+Ты редактор Telegram-новостного канала, который пишет для самой широкой аудитории —
+включая людей без специального образования и без глубокого знания темы.
 
 Тебе дают заголовок и содержание новости.
 
@@ -1254,6 +1269,14 @@ incidents
 8. Если источник не даёт факта, не добавляй его от себя.
 9. Пиши на русском языке.
 10. Категория должна соответствовать главной теме новости.
+11. Пиши МАКСИМАЛЬНО простым и понятным языком, короткими предложениями,
+    как будто объясняешь новость человеку, который впервые слышит о теме.
+12. Избегай канцелярита, штампов и сложных официальных формулировок
+    ("осуществляется", "в рамках", "на фоне" и т.п.) — заменяй их простыми словами.
+13. Если в новости есть специальный термин, аббревиатура, должность или название
+    организации, которые могут быть непонятны обычному читателю — коротко поясни
+    их прямо в тексте (в скобках или отдельной фразой), не превращая это в лекцию.
+14. Не используй профессиональный жаргон без объяснения.
 `;
 
 async function processWithAI(
@@ -1482,6 +1505,47 @@ function extractMedia(
 }
 
 /* =========================================================
+   FRESHNESS
+========================================================= */
+
+/* Возвращает дату публикации новости из RSS-записи, если её удалось
+   определить. Если дата не пришла в фиде — вернёт null (тогда новость
+   не отбрасывается по возрасту, т.к. мы не можем это проверить). */
+function itemPublishedDate(item) {
+  const raw =
+    item.isoDate ||
+    item.pubDate ||
+    null;
+
+  if (!raw) {
+    return null;
+  }
+
+  const date = new Date(raw);
+
+  if (isNaN(date.getTime())) {
+    return null;
+  }
+
+  return date;
+}
+
+function isTooOld(item) {
+  const published =
+    itemPublishedDate(item);
+
+  if (!published) {
+    return false;
+  }
+
+  return (
+    Date.now() -
+      published.getTime() >
+    MAX_NEWS_AGE_MS
+  );
+}
+
+/* =========================================================
    DUPLICATES
 ========================================================= */
 
@@ -1537,14 +1601,18 @@ function similarity(
   );
 }
 
+/* Похожесть заголовков проверяем только по последним записям,
+   а не по всей истории — иначе на большом окне памяти будут
+   случайные ложные совпадения по общим словам */
 function similarToRecent(
   sourceId,
   title
 ) {
   const recent =
-    postedData.sources[
+    (postedData.sources[
       sourceId
-    ] || [];
+    ] || []
+    ).slice(-SIMILARITY_CHECK_WINDOW);
 
   return recent.some(
     (post) =>
@@ -1553,6 +1621,56 @@ function similarToRecent(
         post.title
       ) >=
       SIMILARITY_THRESHOLD
+  );
+}
+
+/* Есть ли эта ссылка уже в нашей истории (это и есть "база того,
+   что публиковалось") */
+function alreadyKnownLink(
+  sourceId,
+  link
+) {
+  return (
+    postedData.sources[
+      sourceId
+    ] || []
+  ).some(
+    (post) => post.link === link
+  );
+}
+
+function pruneOldPosted() {
+  const now = Date.now();
+
+  for (const source of FEEDS) {
+    const list =
+      postedData.sources[
+        source.id
+      ] || [];
+
+    postedData.sources[
+      source.id
+    ] = list
+      .filter((post) => {
+        const time = post.time
+          ? new Date(
+              post.time
+            ).getTime()
+          : 0;
+
+        return (
+          now - time <=
+          POSTED_MAX_AGE_MS
+        );
+      })
+      .slice(
+        -REMEMBER_PER_SOURCE
+      );
+  }
+
+  saveJSON(
+    POSTED_FILE,
+    postedData
   );
 }
 
@@ -1951,7 +2069,7 @@ async function initialSync() {
       const items =
         feed.items.slice(
           0,
-          5
+          20
         );
 
       postedData.sources[
@@ -1960,9 +2078,6 @@ async function initialSync() {
         .filter(
           (item) =>
             item.link
-        )
-        .slice(
-          -REMEMBER_PER_SOURCE
         )
         .map(
           (item) => ({
@@ -2106,9 +2221,8 @@ async function checkFeeds() {
           null;
 
         /*
-           Важно:
-           сравниваем только с двумя
-           последними запомненными.
+           Сравниваем со всей сохранённой историей ссылок по источнику
+           (это и есть наша "база того, что уже публиковалось/видели").
         */
 
         for (
@@ -2122,15 +2236,9 @@ async function checkFeeds() {
           }
 
           const known =
-            (
-              postedData
-                .sources[
-                source.id
-              ] || []
-            ).some(
-              (post) =>
-                post.link ===
-                item.link
+            alreadyKnownLink(
+              source.id,
+              item.link
             );
 
           if (known) {
@@ -2152,6 +2260,29 @@ async function checkFeeds() {
           stats.found =
             (stats.found ||
               0);
+
+          /*
+             Слишком старая новость (по дате из RSS) — запоминаем,
+             чтобы не проверять её снова каждые несколько минут,
+             но не публикуем.
+          */
+
+          if (isTooOld(item)) {
+            stats.skipped =
+              (stats.skipped ||
+                0) + 1;
+
+            state.totalSkipped =
+              (state.totalSkipped ||
+                0) + 1;
+
+            rememberPost(
+              source.id,
+              item
+            );
+
+            continue;
+          }
 
           setStage(
             "🆕 Новая новость",
@@ -2219,6 +2350,9 @@ async function checkFeeds() {
                   ai.category,
 
                 publishedAt:
+                  itemPublishedDate(
+                    item
+                  ) ||
                   new Date(),
               });
 
@@ -2308,6 +2442,8 @@ async function checkFeeds() {
       state
     );
 
+    pruneOldPosted();
+
     if (
       publicationQueue.length
     ) {
@@ -2396,8 +2532,19 @@ async function updateAdminStatus() {
       }
     );
   } catch (error) {
-    adminStatusMessageId =
-      null;
+    /* Если сообщение не найдено/удалено или его нельзя отредактировать —
+       забываем id, чтобы в следующий раз отправить новое сообщение.
+       "message is not modified" — это не ошибка, просто текст не изменился. */
+    if (
+      !String(
+        error.message || ""
+      ).includes(
+        "message is not modified"
+      )
+    ) {
+      adminStatusMessageId =
+        null;
+    }
   }
 }
 
@@ -2419,7 +2566,7 @@ async function notifyStartup() {
             ADMIN_CHAT_ID,
 
           text:
-            `🚀 <b>AI NEWS BOT ОБНОВЛЁН</b>\n\n` +
+            `🚀 <b>NEWS BOT ОБНОВЛЁН</b>\n\n` +
 
             `🧩 Версия:\n` +
             `<code>v${VERSION}</code>\n\n` +
@@ -2428,7 +2575,7 @@ async function notifyStartup() {
             `🧠 ИИ подключён\n` +
             `📡 Источников: ${FEEDS.length}\n` +
             `📤 Лимит: 1 пост / минуту\n` +
-            `💾 Память: последние ${REMEMBER_PER_SOURCE} новости / источник\n` +
+            `💾 Память: ${REMEMBER_PER_SOURCE} записей / источник (до ${Math.round(POSTED_MAX_AGE_MS / (24*60*60*1000))} дней)\n` +
             `🕐 Время: МСК\n\n` +
 
             `Если здесь отображается <code>v${VERSION}</code>, ` +
@@ -2476,95 +2623,156 @@ async function handleCallback(
   const data =
     callback.data;
 
-  await telegram(
-    "answerCallbackQuery",
-    {
-      callback_query_id:
-        callback.id,
-    }
-  );
-
-  if (data === "status") {
+  /*
+     Раньше answerCallbackQuery и вся логика ниже ничем не были
+     обёрнуты: если отправка/редактирование сообщения падало с
+     ошибкой (например, слишком длинный текст или проблема сети),
+     кнопка визуально "крутилась" и просто ничего не происходило,
+     без каких-либо следов в чате. Теперь любая ошибка ловится и
+     присылается админу текстом, плюс попадает в лог.
+  */
+  try {
     await telegram(
-      "sendMessage",
+      "answerCallbackQuery",
       {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          buildStatus(),
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          mainKeyboard(),
+        callback_query_id:
+          callback.id,
       }
     );
-
-    return;
-  }
-
-  if (
-    data === "sources"
-  ) {
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          buildSources(),
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          mainKeyboard(),
-      }
+  } catch (error) {
+    console.error(
+      "answerCallbackQuery:",
+      error.message
     );
-
-    return;
   }
 
-  if (
-    data === "categories"
-  ) {
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
+  try {
+    if (data === "status") {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
 
-        text:
-          buildCategories(),
+          text:
+            buildStatus(),
 
-        parse_mode:
-          "HTML",
+          parse_mode:
+            "HTML",
 
-        reply_markup:
-          categoriesKeyboard(),
-      }
-    );
-
-    return;
-  }
-
-  if (
-    data.startsWith(
-      "cat_"
-    )
-  ) {
-    const categoryId =
-      data.replace(
-        "cat_",
-        ""
+          reply_markup:
+            mainKeyboard(),
+        }
       );
 
+      return;
+    }
+
     if (
-      categoryId ===
-      "all"
+      data === "sources"
+    ) {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
+
+          text:
+            buildSources(),
+
+          parse_mode:
+            "HTML",
+
+          reply_markup:
+            mainKeyboard(),
+        }
+      );
+
+      return;
+    }
+
+    if (
+      data === "categories"
+    ) {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
+
+          text:
+            buildCategories(),
+
+          parse_mode:
+            "HTML",
+
+          reply_markup:
+            categoriesKeyboard(),
+        }
+      );
+
+      return;
+    }
+
+    if (
+      data.startsWith(
+        "cat_"
+      )
+    ) {
+      const categoryId =
+        data.replace(
+          "cat_",
+          ""
+        );
+
+      if (
+        categoryId ===
+        "all"
+      ) {
+        await telegram(
+          "sendMessage",
+          {
+            chat_id:
+              ADMIN_CHAT_ID,
+
+            text:
+              buildTop24(),
+
+            parse_mode:
+              "HTML",
+
+            reply_markup:
+              mainKeyboard(),
+          }
+        );
+
+        return;
+      }
+
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
+
+          text:
+            buildCategoryPosts(
+              categoryId
+            ),
+
+          parse_mode:
+            "HTML",
+
+          reply_markup:
+            categoriesKeyboard(),
+        }
+      );
+
+      return;
+    }
+
+    if (
+      data === "top24"
     ) {
       await telegram(
         "sendMessage",
@@ -2586,222 +2794,206 @@ async function handleCallback(
       return;
     }
 
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          buildCategoryPosts(
-            categoryId
-          ),
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          categoriesKeyboard(),
-      }
-    );
-
-    return;
-  }
-
-  if (
-    data === "top24"
-  ) {
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          buildTop24(),
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          mainKeyboard(),
-      }
-    );
-
-    return;
-  }
-
-  if (
-    data === "statistics"
-  ) {
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          buildStatistics(),
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          mainKeyboard(),
-      }
-    );
-
-    return;
-  }
-
-  if (
-    data === "queue"
-  ) {
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          buildQueue(),
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          mainKeyboard(),
-      }
-    );
-
-    return;
-  }
-
-  if (
-    data ===
-    "toggle_posts"
-  ) {
-    state.postingEnabled =
-      !state.postingEnabled;
-
-    saveJSON(
-      STATE_FILE,
-      state
-    );
-
     if (
-      state.postingEnabled
+      data === "statistics"
     ) {
-      setStage(
-        "▶️ Публикация включена",
-        `${publicationQueue.length} новостей в очереди`
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
+
+          text:
+            buildStatistics(),
+
+          parse_mode:
+            "HTML",
+
+          reply_markup:
+            mainKeyboard(),
+        }
       );
 
-      publicationWorker();
-    } else {
-      setStage(
-        "⛔ Публикация остановлена",
-        "Новые новости продолжают собираться"
-      );
+      return;
     }
 
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
+    if (
+      data === "queue"
+    ) {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
 
-        text:
-          state.postingEnabled
-            ? `▶️ <b>ПУБЛИКАЦИЯ ВКЛЮЧЕНА</b>\n\nОчередь: ${publicationQueue.length}`
-            : `⛔ <b>ПУБЛИКАЦИЯ ОСТАНОВЛЕНА</b>\n\nНовости продолжают проверяться и попадать в очередь.`,
+          text:
+            buildQueue(),
 
-        parse_mode:
-          "HTML",
+          parse_mode:
+            "HTML",
 
-        reply_markup:
-          mainKeyboard(),
+          reply_markup:
+            mainKeyboard(),
+        }
+      );
+
+      return;
+    }
+
+    if (
+      data ===
+      "toggle_posts"
+    ) {
+      state.postingEnabled =
+        !state.postingEnabled;
+
+      saveJSON(
+        STATE_FILE,
+        state
+      );
+
+      if (
+        state.postingEnabled
+      ) {
+        setStage(
+          "▶️ Публикация включена",
+          `${publicationQueue.length} новостей в очереди`
+        );
+
+        publicationWorker();
+      } else {
+        setStage(
+          "⛔ Публикация остановлена",
+          "Новые новости продолжают собираться"
+        );
       }
+
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
+
+          text:
+            state.postingEnabled
+              ? `▶️ <b>ПУБЛИКАЦИЯ ВКЛЮЧЕНА</b>\n\nОчередь: ${publicationQueue.length}`
+              : `⛔ <b>ПУБЛИКАЦИЯ ОСТАНОВЛЕНА</b>\n\nНовости продолжают проверяться и попадать в очередь.`,
+
+          parse_mode:
+            "HTML",
+
+          reply_markup:
+            mainKeyboard(),
+        }
+      );
+
+      return;
+    }
+
+    if (
+      data === "version"
+    ) {
+      await sendVersion();
+      return;
+    }
+
+    if (
+      data === "settings"
+    ) {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
+
+          text:
+            buildSettings(),
+
+          parse_mode:
+            "HTML",
+
+          reply_markup:
+            mainKeyboard(),
+        }
+      );
+
+      return;
+    }
+
+    if (
+      data === "refresh"
+    ) {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
+
+          text:
+            `🔄 <b>Проверка запущена</b>\n\n` +
+            `Смотри раздел «Статус», чтобы видеть текущий этап.`,
+
+          parse_mode:
+            "HTML",
+
+          reply_markup:
+            mainKeyboard(),
+        }
+      );
+
+      checkFeeds();
+
+      return;
+    }
+
+    if (
+      data === "back"
+    ) {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
+
+          text:
+            `🤖 <b>NEWS BOT</b>\n\nВыбери раздел:`,
+
+          parse_mode:
+            "HTML",
+
+          reply_markup:
+            mainKeyboard(),
+        }
+      );
+    }
+  } catch (error) {
+    console.error(
+      `❌ Кнопка "${data}":`,
+      error.message
     );
 
-    return;
-  }
+    try {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
 
-  if (
-    data === "version"
-  ) {
-    await sendVersion();
-    return;
-  }
+          text:
+            `❌ Ошибка при обработке кнопки «${escapeHTML(
+              data
+            )}»:\n<code>${escapeHTML(
+              truncate(
+                error.message,
+                500
+              )
+            )}</code>`,
 
-  if (
-    data === "settings"
-  ) {
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          buildSettings(),
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          mainKeyboard(),
-      }
-    );
-
-    return;
-  }
-
-  if (
-    data === "refresh"
-  ) {
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          `🔄 <b>Проверка запущена</b>\n\n` +
-          `Смотри раздел «Статус», чтобы видеть текущий этап.`,
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          mainKeyboard(),
-      }
-    );
-
-    checkFeeds();
-
-    return;
-  }
-
-  if (
-    data === "back"
-  ) {
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          `🤖 <b>AI NEWS BOT</b>\n\nВыбери раздел:`,
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          mainKeyboard(),
-      }
-    );
+          parse_mode:
+            "HTML",
+        }
+      );
+    } catch {}
   }
 }
 
@@ -2830,47 +3022,54 @@ async function handleAdminMessage(
       message.text || ""
     ).trim();
 
-  if (
-    text === "/start" ||
-    text === "/menu"
-  ) {
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
+  try {
+    if (
+      text === "/start" ||
+      text === "/menu"
+    ) {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
 
-        text:
-          `🤖 <b>AI NEWS BOT v${VERSION}</b>\n\nВыбери раздел:`,
+          text:
+            `🤖 <b>NEWS BOT v${VERSION}</b>\n\nВыбери раздел:`,
 
-        parse_mode:
-          "HTML",
+          parse_mode:
+            "HTML",
 
-        reply_markup:
-          mainKeyboard(),
-      }
-    );
+          reply_markup:
+            mainKeyboard(),
+        }
+      );
 
-    return;
-  }
+      return;
+    }
 
-  if (
-    text === "/check"
-  ) {
-    checkFeeds();
+    if (
+      text === "/check"
+    ) {
+      checkFeeds();
 
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            ADMIN_CHAT_ID,
 
-        text:
-          "🔎 Проверка запущена.",
+          text:
+            "🔎 Проверка запущена.",
 
-        reply_markup:
-          mainKeyboard(),
-      }
+          reply_markup:
+            mainKeyboard(),
+        }
+      );
+    }
+  } catch (error) {
+    console.error(
+      "❌ Команда:",
+      error.message
     );
   }
 }
@@ -3073,7 +3272,7 @@ app.get(
   "/",
   (req, res) => {
     res.send(
-      `AI News Bot v${VERSION} is running.`
+      `News Bot v${VERSION} is running.`
     );
   }
 );
@@ -3180,7 +3379,7 @@ app.get(
     checkFeeds();
 
     res.send(
-      `Проверка запущена. AI News Bot v${VERSION}`
+      `Проверка запущена. News Bot v${VERSION}`
     );
   }
 );
@@ -3200,7 +3399,7 @@ app.listen(
     );
 
     console.log(
-      `🤖 AI NEWS BOT v${VERSION}`
+      `🤖 NEWS BOT v${VERSION}`
     );
 
     console.log(
@@ -3216,7 +3415,7 @@ app.listen(
     );
 
     console.log(
-      `💾 Remember: ${REMEMBER_PER_SOURCE} per source`
+      `💾 Remember: ${REMEMBER_PER_SOURCE} per source (${Math.round(POSTED_MAX_AGE_MS / (24*60*60*1000))}d)`
     );
 
     console.log(
@@ -3227,7 +3426,7 @@ app.listen(
 
     setStage(
       "🚀 Запуск",
-      `AI News Bot v${VERSION}`
+      `News Bot v${VERSION}`
     );
 
     /*
