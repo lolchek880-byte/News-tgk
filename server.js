@@ -23,7 +23,6 @@ const CHECK_INTERVAL_MIN = parseInt(process.env.CHECK_INTERVAL_MIN || "30", 10);
 const RUN_SECRET = process.env.RUN_SECRET || null;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || null;
 
-// насколько похожими должны быть заголовки, чтобы считать это дублем (0-1, чем выше - тем строже)
 const SIMILARITY_THRESHOLD = parseFloat(process.env.SIMILARITY_THRESHOLD || "0.5");
 
 const API_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
@@ -31,15 +30,13 @@ const API_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
 // ---------------- источники новостей (RSS) ----------------
 // 👇 ВОТ СЮДА добавляешь источники: ссылка на RSS + название для поста
 const FEEDS = [
-  { url: "https://techcrunch.com/category/artificial-intelligence/feed/", name: "TechCrunch" },
-  { url: "https://venturebeat.com/category/ai/feed/", name: "VentureBeat" },
-  { url: "https://www.technologyreview.com/topic/artificial-intelligence/feed", name: "MIT Technology Review" },
-  { url: "https://www.artificialintelligence-news.com/feed/", name: "AI News" },
   { url: "https://www.mk.ru/rss/news/index.xml", name: "МК" },
   { url: "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", name: "РБК" },
-  // RTVI не публикует публичную RSS-ссылку явно, это стандартный шаблон - если не сработает,
-  // просто удали эту строку, на остальных источниках это никак не скажется
   { url: "https://rtvi.com/feed/", name: "RTVI" },
+  { url: "https://www.gazeta.ru/export/rss/first.xml", name: "Газета.Ru" },
+  { url: "https://tass.ru/rss/v2.xml?section=politics", name: "ТАСС" },
+  { url: "https://news.rambler.ru/rss/politics/", name: "Рамблер" },
+  // topnews.ru пока пропущен - не нашёл у них рабочую RSS-ссылку
   // { url: "https://example.com/rss", name: "Example" }
 ];
 
@@ -48,15 +45,20 @@ const POSTED_FILE = path.join(__dirname, "data", "posted.json");
 if (!fs.existsSync(path.dirname(POSTED_FILE))) {
   fs.mkdirSync(path.dirname(POSTED_FILE), { recursive: true });
 }
+
+// если файла ещё не было - это "первый запуск" (в том числе после каждого передеплоя,
+// т.к. диск на Railway не постоянный). В первый запуск мы ЗАПОМИНАЕМ все текущие статьи,
+// но НЕ публикуем их - иначе при каждом деплое бот выкидывал бы в канал весь архив разом.
+let isFirstRun = false;
 if (!fs.existsSync(POSTED_FILE)) {
   fs.writeFileSync(POSTED_FILE, JSON.stringify([]));
+  isFirstRun = true;
 }
+
 function loadPosted() {
-  // формат записи: { link, title }
   return JSON.parse(fs.readFileSync(POSTED_FILE, "utf8"));
 }
 function savePosted(list) {
-  // держим последние 300 записей, чтобы файл не рос бесконечно
   fs.writeFileSync(POSTED_FILE, JSON.stringify(list.slice(-300), null, 2));
 }
 
@@ -64,15 +66,14 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ---------------- проверка на похожесть заголовков ----------------
+// ---------------- проверка на похожесть заголовков (защита от дублей с разных сайтов) ----------------
 function normalizeWords(title) {
   return (title || "")
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, "") // убираем знаки препинания (юникод-совместимо, работает и с кириллицей)
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
     .split(/\s+/)
-    .filter((w) => w.length > 3); // отсекаем короткие слова/предлоги, они не несут смысла
+    .filter((w) => w.length > 3);
 }
-
 function jaccardSimilarity(wordsA, wordsB) {
   const setA = new Set(wordsA);
   const setB = new Set(wordsB);
@@ -81,22 +82,19 @@ function jaccardSimilarity(wordsA, wordsB) {
   const union = new Set([...setA, ...setB]).size;
   return intersection / union;
 }
-
 function findSimilarPosted(title, postedList) {
   const words = normalizeWords(title);
   return postedList.find((p) => jaccardSimilarity(words, normalizeWords(p.title)) >= SIMILARITY_THRESHOLD);
 }
 
-// ---------------- как Groq "редактирует" пост ----------------
-// Раз добавили общие новостные сайты (МК, РБК, RTVI) вместе с AI-источниками,
-// промпт обновлён под общий новостной канал, а не только про ИИ.
-// Если хочешь вернуть фокус только на ИИ - поменяй текст здесь.
+// ---------------- как Groq "редактирует" пост (пересказ + перевод заголовка на русский) ----------------
 const EDITOR_PROMPT =
-  "Ты редактор новостного Telegram-канала. " +
-  "Кратко перескажи новость на русском языке (3-5 предложений), только суть, без воды, " +
-  "без вымышленных фактов и без своих оценок.";
+  "Ты редактор новостного Telegram-канала. Тебе дают заголовок и текст новости " +
+  "(возможно не на русском языке). Верни ТОЛЬКО валидный JSON без пояснений, в формате " +
+  '{"title": "заголовок на русском языке", "summary": "краткий пересказ на русском, 3-5 предложений, только суть, без воды и без вымышленных фактов"}. ' +
+  "Если оригинал уже на русском - просто немного отполируй заголовок, смысл не меняй.";
 
-async function summarize(title, content) {
+async function summarizeAndTranslate(title, content) {
   const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -104,21 +102,22 @@ async function summarize(title, content) {
       Authorization: `Bearer ${GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      // llama-3.3-70b-versatile Groq отключает - перешли на более умную и поддерживаемую модель
       model: "openai/gpt-oss-120b",
       messages: [
         { role: "system", content: EDITOR_PROMPT },
         { role: "user", content: `Заголовок: ${title}\n\nТекст статьи: ${content}` },
       ],
       temperature: 0.4,
-      max_tokens: 400,
+      max_tokens: 500,
+      response_format: { type: "json_object" },
     }),
   });
   const data = await resp.json();
   if (!data.choices || !data.choices[0]) {
     throw new Error("Groq error: " + JSON.stringify(data));
   }
-  return data.choices[0].message.content.trim();
+  const parsed = JSON.parse(data.choices[0].message.content);
+  return { title: parsed.title || title, summary: parsed.summary || "" };
 }
 
 // ---------------- поиск картинки/видео в RSS-записи ----------------
@@ -142,7 +141,6 @@ function extractMedia(item) {
   const html = item.content || item["content:encoded"] || "";
   const match = html.match(/<img[^>]+src="([^">]+)"/);
   if (match) return { url: match[1], kind: "photo" };
-
   return null;
 }
 
@@ -178,19 +176,22 @@ async function sendToChannel(text, media) {
 
 // ---------------- основной цикл проверки ----------------
 async function checkFeeds() {
-  console.log("Checking feeds...");
+  console.log(isFirstRun ? "Первый запуск: запоминаю текущие новости без публикации..." : "Checking feeds...");
   const posted = loadPosted();
 
   for (const source of FEEDS) {
     try {
       const feed = await parser.parseURL(source.url);
-      for (const item of feed.items.slice(0, 3)) {
+      for (const item of feed.items.slice(0, 5)) {
         if (!item.link) continue;
-
-        // 1. точный дубль по ссылке - уже публиковали именно эту статью
         if (posted.some((p) => p.link === item.link)) continue;
 
-        // 2. похожая новость с другим источником/ссылкой (та же история, другими словами)
+        // первый запуск (или первый запуск после передеплоя) - просто запоминаем, не постим
+        if (isFirstRun) {
+          posted.push({ link: item.link, title: item.title || "" });
+          continue;
+        }
+
         const similar = findSimilarPosted(item.title || "", posted);
         if (similar) {
           console.log(`Пропущено как дубль: "${item.title}" похоже на "${similar.title}"`);
@@ -200,17 +201,17 @@ async function checkFeeds() {
         }
 
         try {
-          const summary = await summarize(
+          const { title: ruTitle, summary } = await summarizeAndTranslate(
             item.title || "",
             item.contentSnippet || item.content || item.title || ""
           );
-          const text = `📰 ${item.title}\n\n${summary}\n\nИсточник: ${source.name}`;
+          const text = `📰 ${ruTitle}\n\n${summary}\n\nИсточник: ${source.name}`;
           const media = extractMedia(item);
 
           await sendToChannel(text, media);
           posted.push({ link: item.link, title: item.title || "" });
           savePosted(posted);
-          console.log("Posted:", item.title, media ? `(с ${media.kind})` : "(без медиа)");
+          console.log("Posted:", ruTitle, media ? `(с ${media.kind})` : "(без медиа)");
         } catch (e) {
           console.error("Summarize/post error for", item.link, e.message);
         }
@@ -220,6 +221,12 @@ async function checkFeeds() {
     } catch (e) {
       console.error("Feed fetch error:", source.url, e.message);
     }
+  }
+
+  savePosted(posted);
+  if (isFirstRun) {
+    isFirstRun = false;
+    console.log("Готово. Дальше публикуются только по-настоящему новые новости.");
   }
 }
 
@@ -255,9 +262,8 @@ app.get("/run-now", async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.send("AI news bot is running.");
+  res.send("News bot is running.");
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
