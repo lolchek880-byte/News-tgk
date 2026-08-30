@@ -4,189 +4,166 @@ const Parser = require("rss-parser");
 const fs = require("fs");
 const path = require("path");
 
-/*
-=========================================================
-AI NEWS BOT
-VERSION 0.5.0
-=========================================================
-
-Что есть:
-
-- RSS-источники
-- Groq AI
-- Перевод/редактирование новостей
-- Защита от дублей
-- Очередь публикаций
-- Максимум 1 пост в минуту
-- Защита от повторной публикации после restart
-- Админ-меню в Telegram
-- Статус текущего этапа
-- Список источников
-- Статистика
-- Версия бота
-- Уведомление при запуске
-- /status
-- /sources
-- /version
-- /stats
-- /check
-- /help
-- HTTP /run-now
-- HTTP /status
-- HTTP /sources
-
-=========================================================
-*/
-
 const app = express();
 
-/* =======================================================
-   VERSION
-======================================================= */
+/* =========================================================
+   AI NEWS BOT v0.5.1
+========================================================= */
 
-const VERSION = "0.5.0";
-
-/* =======================================================
-   ENV
-======================================================= */
+const VERSION = "0.5.1";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || null;
 
 const CHECK_INTERVAL_MIN = parseInt(
-  process.env.CHECK_INTERVAL_MIN || "30",
+  process.env.CHECK_INTERVAL_MIN || "5",
   10
 );
 
-const RUN_SECRET =
-  process.env.RUN_SECRET || null;
+const RUN_SECRET = process.env.RUN_SECRET || null;
 
-const ADMIN_CHAT_ID =
-  process.env.ADMIN_CHAT_ID || null;
+const TIMEZONE = "Europe/Moscow";
 
-const SIMILARITY_THRESHOLD = parseFloat(
-  process.env.SIMILARITY_THRESHOLD || "0.5"
-);
-
-/*
-   Жёсткий лимит публикаций:
-   1 публикация минимум каждые 60 секунд.
-*/
+/* Максимум 1 пост в минуту */
 const POST_INTERVAL_MS = 60 * 1000;
 
-/*
-   Сколько последних записей RSS проверяем
-   с каждого источника.
-*/
-const ITEMS_PER_FEED = 5;
+/* Сохраняем только 2 последние новости каждого источника */
+const REMEMBER_PER_SOURCE = 2;
 
-/*
-   Сколько записей сохраняем в posted.json.
-*/
-const MAX_POSTED_RECORDS = 1000;
+/* Похожесть */
+const SIMILARITY_THRESHOLD = parseFloat(
+  process.env.SIMILARITY_THRESHOLD || "0.55"
+);
 
-const API_URL =
-  `https://api.telegram.org/bot${BOT_TOKEN}`;
+const API_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-/* =======================================================
-   ENV CHECK
-======================================================= */
-
-if (!BOT_TOKEN) {
-  console.error("❌ BOT_TOKEN не задан");
-}
-
-if (!CHANNEL_ID) {
-  console.error("❌ CHANNEL_ID не задан");
-}
-
-if (!GROQ_API_KEY) {
-  console.error("❌ GROQ_API_KEY не задан");
-}
-
-if (!ADMIN_CHAT_ID) {
-  console.warn(
-    "⚠️ ADMIN_CHAT_ID не задан. Админ-меню и уведомления отключены."
-  );
-}
-
-/* =======================================================
-   RSS PARSER
-======================================================= */
-
-const parser = new Parser({
-  timeout: 15000,
-
-  customFields: {
-    item: [
-      [
-        "media:content",
-        "mediaContent",
-        {
-          keepArray: true,
-        },
-      ],
-
-      [
-        "media:thumbnail",
-        "mediaThumbnail",
-        {
-          keepArray: true,
-        },
-      ],
-    ],
-  },
-});
-
-/* =======================================================
-   NEWS SOURCES
-======================================================= */
+/* =========================================================
+   RSS SOURCES
+========================================================= */
 
 const FEEDS = [
   {
-    url: "https://www.mk.ru/rss/news/index.xml",
+    id: "mk",
     name: "МК",
+    color: "🔴",
+    url: "https://www.mk.ru/rss/news/index.xml",
   },
 
   {
-    url: "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
+    id: "rbc",
     name: "РБК",
+    color: "🔵",
+    url: "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
   },
 
   {
-    url: "https://rtvi.com/feed/",
-    name: "RTVI",
-  },
-
-  {
-    url: "https://www.gazeta.ru/export/rss/first.xml",
+    id: "gazeta",
     name: "Газета.Ru",
+    color: "🟡",
+    url: "https://www.gazeta.ru/export/rss/first.xml",
   },
 
   {
-    url: "https://tass.ru/rss/v2.xml?section=politics",
+    id: "tass",
     name: "ТАСС",
+    color: "⚪️",
+    url: "https://tass.ru/rss/v2.xml?section=politics",
   },
 
   {
-    url: "https://news.rambler.ru/rss/politics/",
+    id: "rambler",
     name: "Рамблер",
+    color: "🟠",
+    url: "https://news.rambler.ru/rss/politics/",
+  },
+
+  {
+    id: "dw",
+    name: "DW",
+    color: "🟢",
+    url: "https://rss.dw.com/rdf/rss-ru-all",
   },
 ];
 
-/* =======================================================
+/* =========================================================
+   CATEGORIES
+========================================================= */
+
+const CATEGORIES = [
+  {
+    id: "politics",
+    name: "Политика",
+    emoji: "🏛",
+  },
+  {
+    id: "economy",
+    name: "Экономика",
+    emoji: "💰",
+  },
+  {
+    id: "world",
+    name: "Мир",
+    emoji: "🌍",
+  },
+  {
+    id: "conflicts",
+    name: "Конфликты",
+    emoji: "⚔️",
+  },
+  {
+    id: "technology",
+    name: "Технологии",
+    emoji: "💻",
+  },
+  {
+    id: "science",
+    name: "Наука",
+    emoji: "🔬",
+  },
+  {
+    id: "space",
+    name: "Космос",
+    emoji: "🚀",
+  },
+  {
+    id: "sport",
+    name: "Спорт",
+    emoji: "🏎",
+  },
+  {
+    id: "culture",
+    name: "Культура",
+    emoji: "🎬",
+  },
+  {
+    id: "society",
+    name: "Общество",
+    emoji: "🌐",
+  },
+  {
+    id: "incidents",
+    name: "Происшествия",
+    emoji: "🚨",
+  },
+];
+
+/* =========================================================
    FILE STORAGE
-======================================================= */
+========================================================= */
 
-const DATA_DIR =
-  path.join(__dirname, "data");
+const DATA_DIR = path.join(__dirname, "data");
 
-const POSTED_FILE =
-  path.join(DATA_DIR, "posted.json");
+const POSTED_FILE = path.join(
+  DATA_DIR,
+  "posted.json"
+);
 
-const STATE_FILE =
-  path.join(DATA_DIR, "state.json");
+const STATE_FILE = path.join(
+  DATA_DIR,
+  "state.json"
+);
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, {
@@ -194,29 +171,36 @@ if (!fs.existsSync(DATA_DIR)) {
   });
 }
 
-function ensureFile(file, data) {
+function writeIfMissing(file, value) {
   if (!fs.existsSync(file)) {
     fs.writeFileSync(
       file,
-      JSON.stringify(data, null, 2),
+      JSON.stringify(value, null, 2),
       "utf8"
     );
   }
 }
 
-ensureFile(
+writeIfMissing(
   POSTED_FILE,
-  []
+  {
+    sources: {},
+  }
 );
 
-ensureFile(
+writeIfMissing(
   STATE_FILE,
   {
-    initialized: false,
     version: VERSION,
+    initialized: false,
+    postingEnabled: true,
+
     startedAt: null,
     lastCheck: null,
     lastPost: null,
+
+    currentStage: "Запуск",
+    currentDetails: "",
 
     totalFound: 0,
     totalPosted: 0,
@@ -224,264 +208,195 @@ ensureFile(
     totalErrors: 0,
 
     sourceStats: {},
+
+    posts24h: {},
   }
 );
 
-function loadJSON(file, fallback) {
+function readJSON(file, fallback) {
   try {
     return JSON.parse(
-      fs.readFileSync(
-        file,
-        "utf8"
-      )
+      fs.readFileSync(file, "utf8")
     );
-  } catch (error) {
-    console.error(
-      `Ошибка чтения ${file}:`,
-      error.message
-    );
-
+  } catch {
     return fallback;
   }
 }
 
-function saveJSON(file, data) {
+function saveJSON(file, value) {
   try {
     fs.writeFileSync(
       file,
-      JSON.stringify(
-        data,
-        null,
-        2
-      ),
+      JSON.stringify(value, null, 2),
       "utf8"
     );
   } catch (error) {
     console.error(
-      `Ошибка записи ${file}:`,
+      "Ошибка сохранения:",
       error.message
     );
   }
 }
 
-function loadPosted() {
-  return loadJSON(
-    POSTED_FILE,
-    []
-  );
-}
+let postedData = readJSON(
+  POSTED_FILE,
+  {
+    sources: {},
+  }
+);
 
-function savePosted(list) {
-  const trimmed =
-    list.slice(
-      -MAX_POSTED_RECORDS
-    );
+let state = readJSON(
+  STATE_FILE,
+  {}
+);
 
-  saveJSON(
-    POSTED_FILE,
-    trimmed
-  );
-}
-
-function loadState() {
-  return loadJSON(
-    STATE_FILE,
-    {}
-  );
-}
-
-function saveState() {
-  saveJSON(
-    STATE_FILE,
-    state
-  );
-}
-
-/* =======================================================
-   STATE
-======================================================= */
-
-let state =
-  loadState();
-
-state.version =
-  VERSION;
-
+state.version = VERSION;
 state.startedAt =
   new Date().toISOString();
 
-if (!state.sourceStats) {
-  state.sourceStats = {};
-}
+state.sourceStats =
+  state.sourceStats || {};
+
+state.posts24h =
+  state.posts24h || {};
 
 for (const source of FEEDS) {
-  if (
-    !state.sourceStats[
-      source.name
-    ]
-  ) {
-    state.sourceStats[
-      source.name
-    ] = {
-      status: "⚪ Не проверялся",
+  if (!Array.isArray(postedData.sources[source.id])) {
+    postedData.sources[source.id] = [];
+  }
+
+  if (!state.sourceStats[source.id]) {
+    state.sourceStats[source.id] = {
       found: 0,
+      posted: 0,
+      skipped: 0,
+      errors: 0,
+      status: "⚪ Не проверялся",
       lastCheck: null,
-      error: null,
+      lastError: null,
     };
   }
 }
 
-saveState();
+saveJSON(
+  POSTED_FILE,
+  postedData
+);
 
-/* =======================================================
+saveJSON(
+  STATE_FILE,
+  state
+);
+
+/* =========================================================
    RUNTIME
-======================================================= */
+========================================================= */
 
 let isChecking = false;
-
-let isInitialized =
-  Boolean(state.initialized);
-
 let publisherRunning = false;
+let adminPollingRunning = false;
 
-let lastStage =
-  "🚀 Запуск";
+let publicationQueue = [];
 
-let lastStageDetails =
-  "Подготовка бота";
+let lastPublicationTime = state.lastPost
+  ? new Date(state.lastPost).getTime()
+  : 0;
 
-let adminStatusMessageId =
-  null;
-
-/*
-   Очередь публикаций.
-*/
-const publicationQueue = [];
-
-/*
-   Последнее время публикации.
-*/
-let lastPublicationTime =
-  state.lastPost
-    ? new Date(
-        state.lastPost
-      ).getTime()
-    : 0;
-
-/*
-   Telegram polling offset.
-*/
 let telegramUpdateOffset = 0;
 
-let adminPollingRunning =
-  false;
+let adminStatusMessageId = null;
 
-/* =======================================================
-   UTILS
-======================================================= */
+/* =========================================================
+   HELPERS
+========================================================= */
 
 function sleep(ms) {
   return new Promise(
-    (resolve) =>
-      setTimeout(resolve, ms)
+    (resolve) => setTimeout(resolve, ms)
   );
 }
 
-function formatDate(date) {
-  if (!date) {
-    return "—";
-  }
-
-  try {
-    return new Date(
-      date
-    ).toLocaleString(
-      "ru-RU",
-      {
-        timeZone:
-          "Europe/Moscow",
-        hour12: false,
-      }
-    );
-  } catch {
-    return "—";
-  }
+function escapeHTML(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
-function escapeHTML(text) {
-  return String(
-    text || ""
-  )
-    .replace(
-      /&/g,
-      "&amp;"
-    )
-    .replace(
-      /</g,
-      "&lt;"
-    )
-    .replace(
-      />/g,
-      "&gt;"
-    );
-}
+function truncate(value, max) {
+  const text = String(value || "")
+    .trim();
 
-/* =======================================================
-   STAGE SYSTEM
-======================================================= */
+  if (text.length <= max) {
+    return text;
+  }
 
-function setStage(
-  stage,
-  details = ""
-) {
-  lastStage =
-    stage;
-
-  lastStageDetails =
-    details;
-
-  console.log(
-    `[STAGE] ${stage}` +
-    (
-      details
-        ? ` — ${details}`
-        : ""
-    )
+  return (
+    text
+      .slice(0, max - 1)
+      .trimEnd() + "…"
   );
-
-  updateAdminStatus()
-    .catch(() => {});
 }
 
-/* =======================================================
+function moscowDate(date = new Date()) {
+  return new Intl.DateTimeFormat(
+    "ru-RU",
+    {
+      timeZone: TIMEZONE,
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }
+  ).format(date);
+}
+
+function moscowTime(date = new Date()) {
+  return new Intl.DateTimeFormat(
+    "ru-RU",
+    {
+      timeZone: TIMEZONE,
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }
+  ).format(date);
+}
+
+function sourceById(id) {
+  return FEEDS.find(
+    (source) => source.id === id
+  );
+}
+
+function categoryById(id) {
+  return CATEGORIES.find(
+    (category) => category.id === id
+  );
+}
+
+/* =========================================================
    TELEGRAM API
-======================================================= */
+========================================================= */
 
 async function telegram(
   method,
   body = {}
 ) {
-  if (!BOT_TOKEN) {
-    throw new Error(
-      "BOT_TOKEN не задан"
-    );
-  }
-
-  const response =
-    await fetch(
-      `${API_URL}/${method}`,
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type":
-            "application/json",
-        },
-
-        body:
-          JSON.stringify(body),
-      }
-    );
+  const response = await fetch(
+    `${API_URL}/${method}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type":
+          "application/json",
+      },
+      body: JSON.stringify(body),
+    }
+  );
 
   const data =
     await response.json();
@@ -489,118 +404,1943 @@ async function telegram(
   if (!data.ok) {
     throw new Error(
       data.description ||
-      `Telegram ${method} error`
+        `Telegram ${method} error`
     );
   }
 
   return data.result;
 }
 
-/* =======================================================
-   ADMIN STATUS
-======================================================= */
+/* =========================================================
+   STAGE
+========================================================= */
 
-function getQueueStatus() {
-  if (
-    publicationQueue.length === 0
-  ) {
-    return "📦 Очередь: 0";
-  }
+function setStage(
+  stage,
+  details = ""
+) {
+  state.currentStage = stage;
+  state.currentDetails =
+    details;
 
-  return (
-    `📦 Очередь: ` +
-    `${publicationQueue.length}`
+  saveJSON(
+    STATE_FILE,
+    state
+  );
+
+  console.log(
+    `[${moscowTime()} МСК] ${stage}` +
+      (details
+        ? ` — ${details}`
+        : "")
+  );
+
+  updateAdminStatus().catch(
+    () => {}
   );
 }
 
-function getNextPublicationText() {
+/* =========================================================
+   ADMIN KEYBOARD
+========================================================= */
+
+function mainKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "📊 Статус",
+          callback_data:
+            "status",
+        },
+        {
+          text: "📡 Источники",
+          callback_data:
+            "sources",
+        },
+      ],
+
+      [
+        {
+          text: "📂 Разделы",
+          callback_data:
+            "categories",
+        },
+        {
+          text: "🏆 Топ 24ч",
+          callback_data:
+            "top24",
+        },
+      ],
+
+      [
+        {
+          text: "📈 Статистика",
+          callback_data:
+            "statistics",
+        },
+        {
+          text: "📦 Очередь",
+          callback_data:
+            "queue",
+        },
+      ],
+
+      [
+        {
+          text: state.postingEnabled
+            ? "⛔ Стоп посты"
+            : "▶️ Запустить посты",
+          callback_data:
+            "toggle_posts",
+        },
+      ],
+
+      [
+        {
+          text: "🧩 Версия",
+          callback_data:
+            "version",
+        },
+        {
+          text: "⚙️ Настройки",
+          callback_data:
+            "settings",
+        },
+      ],
+
+      [
+        {
+          text: "🔄 Обновить",
+          callback_data:
+            "refresh",
+        },
+      ],
+    ],
+  };
+}
+
+/* =========================================================
+   STATUS
+========================================================= */
+
+function buildStatus() {
+  const posting =
+    state.postingEnabled
+      ? "🟢 ВКЛ"
+      : "🔴 ВЫКЛ";
+
+  let nextPost = "—";
+
   if (
-    publicationQueue.length === 0
+    publicationQueue.length &&
+    lastPublicationTime
   ) {
-    return "—";
-  }
-
-  if (!lastPublicationTime) {
-    return "сейчас";
-  }
-
-  const elapsed =
-    Date.now() -
-    lastPublicationTime;
-
-  const remaining =
-    Math.max(
-      0,
+    const remaining =
       POST_INTERVAL_MS -
-        elapsed
-    );
+      (Date.now() -
+        lastPublicationTime);
 
-  if (remaining <= 0) {
-    return "сейчас";
+    nextPost =
+      remaining <= 0
+        ? "сейчас"
+        : `через ${Math.ceil(
+            remaining / 1000
+          )} сек.`;
   }
 
   return (
-    `через ${Math.ceil(
-      remaining / 1000
-    )} сек.`
-  );
-}
+    `🤖 <b>AI NEWS BOT</b>\n\n` +
+    `🧩 Версия: <code>${VERSION}</code>\n` +
+    `📤 Посты: ${posting}\n` +
+    `📦 Очередь: <b>${publicationQueue.length}</b>\n` +
+    `🕐 МСК: <b>${moscowTime()} МСК</b>\n\n` +
 
-function buildStatusText() {
-  const status =
-    isChecking
-      ? "🟢 Проверка выполняется"
-      : "⚪ Ожидание";
-
-  return (
-    `🤖 <b>AI News Bot</b>\n\n` +
-
-    `🧩 Версия: ` +
-    `<code>${VERSION}</code>\n` +
-
-    `${status}\n\n` +
-
-    `📍 <b>Текущий этап</b>\n` +
-    `${escapeHTML(lastStage)}\n` +
-
-    (
-      lastStageDetails
-        ? `${escapeHTML(
-            lastStageDetails
-          )}\n`
+    `━━━━━━━━━━━━━━\n` +
+    `📍 <b>ТЕКУЩИЙ ЭТАП</b>\n\n` +
+    `${escapeHTML(
+      state.currentStage
+    )}\n` +
+    `${
+      state.currentDetails
+        ? escapeHTML(
+            state.currentDetails
+          )
         : ""
-    ) +
+    }\n\n` +
 
-    `\n` +
-
-    `${getQueueStatus()}\n` +
-
-    `📤 Следующая публикация: ` +
-    `${getNextPublicationText()}\n\n` +
-
-    `📰 Найдено: ` +
-    `${state.totalFound || 0}\n` +
-
-    `✅ Опубликовано: ` +
-    `${state.totalPosted || 0}\n` +
-
-    `⏭ Пропущено: ` +
-    `${state.totalSkipped || 0}\n` +
-
-    `❌ Ошибок: ` +
-    `${state.totalErrors || 0}\n\n` +
+    `━━━━━━━━━━━━━━\n` +
+    `📤 Следующий пост: <b>${nextPost}</b>\n` +
+    `🔎 Найдено: ${state.totalFound || 0}\n` +
+    `✅ Опубликовано: ${state.totalPosted || 0}\n` +
+    `⏭ Пропущено: ${state.totalSkipped || 0}\n` +
+    `❌ Ошибок: ${state.totalErrors || 0}\n\n` +
 
     `🕐 Последняя проверка:\n` +
-    `${formatDate(
-      state.lastCheck
-    )}\n\n` +
+    `${state.lastCheck
+      ? moscowDate(
+          state.lastCheck
+        ) + " МСК"
+      : "—"}\n\n` +
 
-    `📤 Последняя публикация:\n` +
-    `${formatDate(
-      state.lastPost
-    )}`
+    `📤 Последний пост:\n` +
+    `${state.lastPost
+      ? moscowDate(
+          state.lastPost
+        ) + " МСК"
+      : "—"}`
   );
 }
+
+/* =========================================================
+   SOURCES
+========================================================= */
+
+function buildSources() {
+  let text =
+    `📡 <b>ИСТОЧНИКИ НОВОСТЕЙ</b>\n\n`;
+
+  for (
+    const source of FEEDS
+  ) {
+    const stats =
+      state.sourceStats[
+        source.id
+      ] || {};
+
+    const remembered =
+      postedData.sources[
+        source.id
+      ] || [];
+
+    text +=
+      `${source.color} <b>${escapeHTML(
+        source.name
+      )}</b>\n` +
+
+      `Статус: ${
+        stats.status ||
+        "⚪ Не проверялся"
+      }\n` +
+
+      `🔎 Найдено: ${
+        stats.found || 0
+      }\n` +
+
+      `📤 Опубликовано: ${
+        stats.posted || 0
+      }\n` +
+
+      `⏭ Дубли: ${
+        stats.skipped || 0
+      }\n` +
+
+      `❌ Ошибки: ${
+        stats.errors || 0
+      }\n` +
+
+      `💾 Запомнено: ${
+        remembered.length
+      } / ${REMEMBER_PER_SOURCE}\n` +
+
+      `🕐 ${
+        stats.lastCheck
+          ? moscowDate(
+              stats.lastCheck
+            ) + " МСК"
+          : "—"
+      }\n`;
+
+    if (stats.lastError) {
+      text +=
+        `⚠️ ${escapeHTML(
+          truncate(
+            stats.lastError,
+            150
+          )
+        )}\n`;
+    }
+
+    text += "\n";
+  }
+
+  text +=
+    `━━━━━━━━━━━━━━\n` +
+    `🟢 Работает\n` +
+    `🔴 Ошибка\n` +
+    `⚪️ Не проверялся`;
+
+  return text;
+}
+
+/* =========================================================
+   CATEGORIES MENU
+========================================================= */
+
+function categoriesKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "🏛 Политика",
+          callback_data:
+            "cat_politics",
+        },
+        {
+          text: "💰 Экономика",
+          callback_data:
+            "cat_economy",
+        },
+      ],
+
+      [
+        {
+          text: "🌍 Мир",
+          callback_data:
+            "cat_world",
+        },
+        {
+          text: "⚔️ Конфликты",
+          callback_data:
+            "cat_conflicts",
+        },
+      ],
+
+      [
+        {
+          text: "💻 Технологии",
+          callback_data:
+            "cat_technology",
+        },
+        {
+          text: "🔬 Наука",
+          callback_data:
+            "cat_science",
+        },
+      ],
+
+      [
+        {
+          text: "🚀 Космос",
+          callback_data:
+            "cat_space",
+        },
+        {
+          text: "🏎 Спорт",
+          callback_data:
+            "cat_sport",
+        },
+      ],
+
+      [
+        {
+          text: "🎬 Культура",
+          callback_data:
+            "cat_culture",
+        },
+        {
+          text: "🌐 Общество",
+          callback_data:
+            "cat_society",
+        },
+      ],
+
+      [
+        {
+          text: "🚨 Происшествия",
+          callback_data:
+            "cat_incidents",
+        },
+      ],
+
+      [
+        {
+          text: "📋 Все новости",
+          callback_data:
+            "cat_all",
+        },
+      ],
+
+      [
+        {
+          text: "⬅️ Назад",
+          callback_data:
+            "back",
+        },
+      ],
+    ],
+  };
+}
+
+function getCategoryStats() {
+  const stats = {};
+
+  for (
+    const category of CATEGORIES
+  ) {
+    stats[category.id] = 0;
+  }
+
+  for (
+    const key of Object.keys(
+      state.posts24h || {}
+    )
+  ) {
+    const post =
+      state.posts24h[key];
+
+    if (
+      post &&
+      stats[post.category] !==
+        undefined
+    ) {
+      stats[
+        post.category
+      ]++;
+    }
+  }
+
+  return stats;
+}
+
+function buildCategories() {
+  const stats =
+    getCategoryStats();
+
+  let text =
+    `📂 <b>РАЗДЕЛЫ</b>\n\n`;
+
+  for (
+    const category of CATEGORIES
+  ) {
+    text +=
+      `${category.emoji} <b>${category.name}</b> — ${stats[category.id] || 0} постов\n`;
+  }
+
+  return text;
+}
+
+/* =========================================================
+   CATEGORY POSTS
+========================================================= */
+
+function buildCategoryPosts(
+  categoryId
+) {
+  const category =
+    categoryById(
+      categoryId
+    );
+
+  const posts =
+    Object.values(
+      state.posts24h || {}
+    )
+      .filter(
+        (post) =>
+          post.category ===
+          categoryId
+      )
+      .sort(
+        (a, b) =>
+          (b.reactions || 0) -
+          (a.reactions || 0)
+      )
+      .slice(0, 10);
+
+  if (!posts.length) {
+    return (
+      `${category?.emoji || "📂"} <b>${escapeHTML(
+        category?.name ||
+          "Раздел"
+      )}</b>\n\n` +
+      `За последние 24 часа публикаций нет.`
+    );
+  }
+
+  let text =
+    `${category.emoji} <b>${category.name.toUpperCase()}</b>\n\n`;
+
+  posts.forEach(
+    (post, index) => {
+      const source =
+        sourceById(
+          post.source
+        );
+
+      text +=
+        `${index + 1}. <b>${escapeHTML(
+          truncate(
+            post.title,
+            120
+          )
+        )}</b>\n` +
+        `${source?.color || "📡"} ${escapeHTML(
+          source?.name ||
+            post.source
+        )} • ❤️ ${
+          post.reactions || 0
+        }\n\n`;
+    }
+  );
+
+  return text;
+}
+
+/* =========================================================
+   TOP 24 HOURS
+========================================================= */
+
+function clean24h() {
+  const now =
+    Date.now();
+
+  const day =
+    24 * 60 * 60 * 1000;
+
+  for (
+    const key of Object.keys(
+      state.posts24h || {}
+    )
+  ) {
+    const post =
+      state.posts24h[key];
+
+    if (
+      !post ||
+      now -
+        new Date(
+          post.publishedAt
+        ).getTime() >
+        day
+    ) {
+      delete state.posts24h[key];
+    }
+  }
+
+  saveJSON(
+    STATE_FILE,
+    state
+  );
+}
+
+function buildTop24() {
+  clean24h();
+
+  const posts =
+    Object.values(
+      state.posts24h || {}
+    )
+      .sort(
+        (a, b) =>
+          (b.reactions || 0) -
+          (a.reactions || 0)
+      )
+      .slice(0, 10);
+
+  if (!posts.length) {
+    return (
+      `🏆 <b>ТОП ЗА 24 ЧАСА</b>\n\n` +
+      `Пока нет публикаций.`
+    );
+  }
+
+  let text =
+    `🏆 <b>ТОП НОВОСТЕЙ ЗА 24 ЧАСА</b>\n\n`;
+
+  const medals = [
+    "🥇",
+    "🥈",
+    "🥉",
+  ];
+
+  posts.forEach(
+    (post, index) => {
+      const source =
+        sourceById(
+          post.source
+        );
+
+      const category =
+        categoryById(
+          post.category
+        );
+
+      text +=
+        `${medals[index] || `${index + 1}.`} ` +
+        `<b>${escapeHTML(
+          truncate(
+            post.title,
+            130
+          )
+        )}</b>\n` +
+
+        `${source?.color || "📡"} ` +
+        `${escapeHTML(
+          source?.name ||
+            post.source
+        )}` +
+
+        ` • ${category?.emoji || "📂"} ` +
+        `${escapeHTML(
+          category?.name ||
+            "Новости"
+        )}\n` +
+
+        `❤️ <b>${
+          post.reactions || 0
+        }</b> реакций\n\n`;
+    }
+  );
+
+  return text;
+}
+
+/* =========================================================
+   STATISTICS
+========================================================= */
+
+function buildStatistics() {
+  let text =
+    `📈 <b>СТАТИСТИКА САЙТОВ</b>\n\n`;
+
+  for (
+    const source of FEEDS
+  ) {
+    const stats =
+      state.sourceStats[
+        source.id
+      ] || {};
+
+    text +=
+      `${source.color} <b>${escapeHTML(
+        source.name
+      )}</b>\n` +
+      `🔎 Найдено: ${
+        stats.found || 0
+      }\n` +
+      `📤 Опубликовано: ${
+        stats.posted || 0
+      }\n` +
+      `⏭ Дубли: ${
+        stats.skipped || 0
+      }\n` +
+      `❌ Ошибки: ${
+        stats.errors || 0
+      }\n` +
+      `📡 ${
+        stats.status ||
+        "⚪ Не проверялся"
+      }\n` +
+      `🕐 ${
+        stats.lastCheck
+          ? moscowDate(
+              stats.lastCheck
+            ) + " МСК"
+          : "—"
+      }\n\n`;
+  }
+
+  text +=
+    `━━━━━━━━━━━━━━\n` +
+    `📊 Всего найдено: ${
+      state.totalFound || 0
+    }\n` +
+    `📤 Всего опубликовано: ${
+      state.totalPosted || 0
+    }\n` +
+    `⏭ Всего пропущено: ${
+      state.totalSkipped || 0
+    }\n` +
+    `❌ Всего ошибок: ${
+      state.totalErrors || 0
+    }`;
+
+  return text;
+}
+
+/* =========================================================
+   QUEUE
+========================================================= */
+
+function buildQueue() {
+  if (
+    !publicationQueue.length
+  ) {
+    return (
+      `📦 <b>ОЧЕРЕДЬ</b>\n\n` +
+      `Очередь пуста.\n\n` +
+      `⏱ Ограничение: 1 пост в минуту`
+    );
+  }
+
+  let text =
+    `📦 <b>ОЧЕРЕДЬ ПУБЛИКАЦИЙ</b>\n\n` +
+    `Всего: <b>${publicationQueue.length}</b>\n` +
+    `⏱ 1 пост / 60 секунд\n\n`;
+
+  publicationQueue
+    .slice(0, 15)
+    .forEach(
+      (post, index) => {
+        const source =
+          sourceById(
+            post.source
+          );
+
+        text +=
+          `${index + 1}. <b>${escapeHTML(
+            truncate(
+              post.title,
+              100
+            )
+          )}</b>\n` +
+          `${source?.color || "📡"} ${
+            source?.name ||
+            post.source
+          }\n\n`;
+      }
+    );
+
+  return text;
+}
+
+/* =========================================================
+   SETTINGS
+========================================================= */
+
+function buildSettings() {
+  return (
+    `⚙️ <b>НАСТРОЙКИ</b>\n\n` +
+
+    `🧩 Версия: <code>${VERSION}</code>\n` +
+    `📡 Источников: ${FEEDS.length}\n` +
+    `🔄 Проверка RSS: каждые ${CHECK_INTERVAL_MIN} мин.\n` +
+    `📤 Публикация: 1 пост / 60 сек.\n` +
+    `💾 Запоминание: последние ${REMEMBER_PER_SOURCE} новости на источник\n` +
+    `🧠 Модель: <code>openai/gpt-oss-120b</code>\n` +
+    `🕐 Часовой пояс: <code>Europe/Moscow</code>\n` +
+    `🛡 Похожесть: ${
+      SIMILARITY_THRESHOLD * 100
+    }%\n\n` +
+
+    `📂 Категории определяет ИИ.\n` +
+    `🎨 Каждый источник имеет свой цвет.\n` +
+    `📊 Статистика ведётся отдельно по каждому сайту.`
+  );
+}
+
+/* =========================================================
+   VERSION
+========================================================= */
+
+async function sendVersion() {
+  if (!ADMIN_CHAT_ID) return;
+
+  await telegram(
+    "sendMessage",
+    {
+      chat_id:
+        ADMIN_CHAT_ID,
+
+      text:
+        `🧩 <b>ВЕРСИЯ AI NEWS BOT</b>\n\n` +
+        `🚀 Сейчас запущена:\n` +
+        `<code>v${VERSION}</code>\n\n` +
+
+        `🟢 Сервер работает\n` +
+        `🧠 Groq подключён\n` +
+        `📡 Источников: ${FEEDS.length}\n` +
+        `📤 1 пост / минуту\n` +
+        `🕐 МСК\n\n` +
+
+        `Если ты видишь <code>v${VERSION}</code>, ` +
+        `значит новая версия действительно запустилась на сервере.`,
+
+      parse_mode: "HTML",
+
+      reply_markup:
+        mainKeyboard(),
+    }
+  );
+}
+
+/* =========================================================
+   POST FORMAT
+========================================================= */
+
+function buildPost({
+  title,
+  summary,
+  source,
+  category,
+  publishedAt,
+}) {
+  const categoryInfo =
+    categoryById(
+      category
+    );
+
+  return (
+    `📰 <b>${escapeHTML(
+      truncate(title, 250)
+    )}</b>\n\n` +
+
+    `${escapeHTML(
+      summary
+    )}\n\n` +
+
+    `━━━━━━━━━━━━━━\n` +
+
+    `${categoryInfo?.emoji || "📂"} <b>${
+      categoryInfo?.name ||
+      "Новости"
+    }</b>\n` +
+
+    `🕐 ${moscowTime(
+      publishedAt
+    )} МСК\n` +
+
+    `📡 Источник: ${
+      source.color
+    } <b>${escapeHTML(
+      source.name
+    )}</b>\n` +
+
+    `🤖 <b>AI News</b>`
+  );
+}
+
+/* =========================================================
+   GROQ
+========================================================= */
+
+const EDITOR_PROMPT = `
+Ты профессиональный редактор Telegram-новостного канала.
+
+Тебе дают заголовок и содержание новости.
+
+Нужно вернуть ТОЛЬКО JSON:
+
+{
+  "title": "...",
+  "summary": "...",
+  "category": "..."
+}
+
+category должен быть одним из:
+
+politics
+economy
+world
+conflicts
+technology
+science
+space
+sport
+culture
+society
+incidents
+
+Правила:
+
+1. Заголовок должен быть коротким и понятным.
+2. Заголовок не должен быть кликбейтом.
+3. summary должен состоять из 3-5 коротких абзацев/предложений.
+4. Не выдумывай факты.
+5. Не повторяй заголовок в summary.
+6. Убирай воду.
+7. Сохраняй важные цифры, имена, даты и факты.
+8. Если источник не даёт факта, не добавляй его от себя.
+9. Пиши на русском языке.
+10. Категория должна соответствовать главной теме новости.
+`;
+
+async function processWithAI(
+  title,
+  content
+) {
+  const response =
+    await fetch(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json",
+
+          Authorization:
+            `Bearer ${GROQ_API_KEY}`,
+        },
+
+        body: JSON.stringify({
+          model:
+            "openai/gpt-oss-120b",
+
+          messages: [
+            {
+              role: "system",
+              content:
+                EDITOR_PROMPT,
+            },
+
+            {
+              role: "user",
+              content:
+                `Заголовок:\n${title}\n\n` +
+                `Текст:\n${content}`,
+            },
+          ],
+
+          temperature: 0.3,
+
+          max_tokens: 700,
+
+          response_format: {
+            type: "json_object",
+          },
+        }),
+      }
+    );
+
+  const data =
+    await response.json();
+
+  if (
+    !data.choices ||
+    !data.choices[0]
+  ) {
+    throw new Error(
+      "Groq error: " +
+        JSON.stringify(data)
+    );
+  }
+
+  const result =
+    JSON.parse(
+      data.choices[0]
+        .message.content
+    );
+
+  let category =
+    result.category;
+
+  if (
+    !CATEGORIES.some(
+      (item) =>
+        item.id === category
+    )
+  ) {
+    category = "world";
+  }
+
+  return {
+    title:
+      result.title ||
+      title,
+
+    summary:
+      result.summary ||
+      "",
+
+    category,
+  };
+}
+
+/* =========================================================
+   MEDIA
+========================================================= */
+
+const parser =
+  new Parser({
+    timeout: 15000,
+
+    customFields: {
+      item: [
+        [
+          "media:content",
+          "mediaContent",
+          {
+            keepArray:
+              true,
+          },
+        ],
+
+        [
+          "media:thumbnail",
+          "mediaThumbnail",
+          {
+            keepArray:
+              true,
+          },
+        ],
+      ],
+    },
+  });
+
+function extractMedia(
+  item
+) {
+  if (
+    item.enclosure &&
+    item.enclosure.url
+  ) {
+    const type =
+      item.enclosure.type ||
+      "";
+
+    if (
+      type.startsWith(
+        "video"
+      )
+    ) {
+      return {
+        url:
+          item.enclosure
+            .url,
+        kind: "video",
+      };
+    }
+
+    if (
+      type.startsWith(
+        "image"
+      )
+    ) {
+      return {
+        url:
+          item.enclosure
+            .url,
+        kind: "photo",
+      };
+    }
+  }
+
+  if (
+    item.mediaContent &&
+    item.mediaContent
+      .length
+  ) {
+    const media =
+      item.mediaContent[0]
+        .$ || {};
+
+    if (media.url) {
+      const type =
+        media.medium ||
+        media.type ||
+        "";
+
+      return {
+        url: media.url,
+        kind:
+          type.includes(
+            "video"
+          )
+            ? "video"
+            : "photo",
+      };
+    }
+  }
+
+  if (
+    item.mediaThumbnail &&
+    item.mediaThumbnail
+      .length
+  ) {
+    const media =
+      item.mediaThumbnail[0]
+        .$ || {};
+
+    if (media.url) {
+      return {
+        url: media.url,
+        kind: "photo",
+      };
+    }
+  }
+
+  const html =
+    item.content ||
+    item["content:encoded"] ||
+    "";
+
+  const match =
+    html.match(
+      /<img[^>]+src=["']([^"']+)["']/
+    );
+
+  if (match) {
+    return {
+      url: match[1],
+      kind: "photo",
+    };
+  }
+
+  return null;
+}
+
+/* =========================================================
+   DUPLICATES
+========================================================= */
+
+function normalizeWords(
+  title
+) {
+  return (
+    title || ""
+  )
+    .toLowerCase()
+    .replace(
+      /[^\p{L}\p{N}\s]/gu,
+      ""
+    )
+    .split(/\s+/)
+    .filter(
+      (word) =>
+        word.length > 3
+    );
+}
+
+function similarity(
+  a,
+  b
+) {
+  const A = new Set(
+    normalizeWords(a)
+  );
+
+  const B = new Set(
+    normalizeWords(b)
+  );
+
+  if (!A.size || !B.size) {
+    return 0;
+  }
+
+  const intersection =
+    [...A].filter(
+      (word) =>
+        B.has(word)
+    ).length;
+
+  const union =
+    new Set([
+      ...A,
+      ...B,
+    ]).size;
+
+  return (
+    intersection /
+    union
+  );
+}
+
+function similarToRecent(
+  sourceId,
+  title
+) {
+  const recent =
+    postedData.sources[
+      sourceId
+    ] || [];
+
+  return recent.some(
+    (post) =>
+      similarity(
+        title,
+        post.title
+      ) >=
+      SIMILARITY_THRESHOLD
+  );
+}
+
+function rememberPost(
+  sourceId,
+  item
+) {
+  if (
+    !postedData.sources[
+      sourceId
+    ]
+  ) {
+    postedData.sources[
+      sourceId
+    ] = [];
+  }
+
+  postedData.sources[
+    sourceId
+  ].push({
+    link: item.link,
+    title:
+      item.title || "",
+    time:
+      new Date().toISOString(),
+  });
+
+  postedData.sources[
+    sourceId
+  ] =
+    postedData.sources[
+      sourceId
+    ].slice(
+      -REMEMBER_PER_SOURCE
+    );
+
+  saveJSON(
+    POSTED_FILE,
+    postedData
+  );
+}
+
+/* =========================================================
+   QUEUE
+========================================================= */
+
+function alreadyQueued(
+  link
+) {
+  return publicationQueue.some(
+    (post) =>
+      post.link === link
+  );
+}
+
+function queuePost(post) {
+  if (
+    alreadyQueued(
+      post.link
+    )
+  ) {
+    return false;
+  }
+
+  publicationQueue.push(
+    post
+  );
+
+  console.log(
+    `📦 В очередь: ${post.title}`
+  );
+
+  updateAdminStatus().catch(
+    () => {}
+  );
+
+  return true;
+}
+
+/* =========================================================
+   SEND CHANNEL
+========================================================= */
+
+async function sendChannel(
+  text,
+  media
+) {
+  try {
+    if (
+      media &&
+      media.kind ===
+        "photo"
+    ) {
+      return await telegram(
+        "sendPhoto",
+        {
+          chat_id:
+            CHANNEL_ID,
+
+          photo:
+            media.url,
+
+          caption:
+            text.slice(
+              0,
+              1024
+            ),
+
+          parse_mode:
+            "HTML",
+        }
+      );
+    }
+
+    if (
+      media &&
+      media.kind ===
+        "video"
+    ) {
+      return await telegram(
+        "sendVideo",
+        {
+          chat_id:
+            CHANNEL_ID,
+
+          video:
+            media.url,
+
+          caption:
+            text.slice(
+              0,
+              1024
+            ),
+
+          parse_mode:
+            "HTML",
+        }
+      );
+    }
+
+    return await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          CHANNEL_ID,
+
+        text,
+
+        parse_mode:
+          "HTML",
+
+        disable_web_page_preview:
+          true,
+      }
+    );
+  } catch (error) {
+    if (media) {
+      console.warn(
+        "⚠️ Медиа не отправилось:",
+        error.message
+      );
+
+      return await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            CHANNEL_ID,
+
+          text,
+
+          parse_mode:
+            "HTML",
+
+          disable_web_page_preview:
+            true,
+        }
+      );
+    }
+
+    throw error;
+  }
+}
+
+/* =========================================================
+   PUBLICATION WORKER
+========================================================= */
+
+async function publicationWorker() {
+  if (
+    publisherRunning
+  ) {
+    return;
+  }
+
+  if (
+    !state.postingEnabled
+  ) {
+    setStage(
+      "⛔ Публикация остановлена",
+      "Ожидание команды «Запустить посты»"
+    );
+
+    return;
+  }
+
+  if (
+    !publicationQueue.length
+  ) {
+    return;
+  }
+
+  publisherRunning =
+    true;
+
+  try {
+    while (
+      publicationQueue.length &&
+      state.postingEnabled
+    ) {
+      const elapsed =
+        lastPublicationTime
+          ? Date.now() -
+            lastPublicationTime
+          : POST_INTERVAL_MS;
+
+      const wait =
+        POST_INTERVAL_MS -
+        elapsed;
+
+      if (wait > 0) {
+        setStage(
+          "⏳ Ожидание",
+          `Следующий пост через ${Math.ceil(
+            wait / 1000
+          )} сек.`
+        );
+
+        await sleep(
+          wait
+        );
+      }
+
+      if (
+        !state.postingEnabled
+      ) {
+        break;
+      }
+
+      const post =
+        publicationQueue.shift();
+
+      if (!post) {
+        continue;
+      }
+
+      const source =
+        sourceById(
+          post.source
+        );
+
+      setStage(
+        "📤 Публикация",
+        `${source?.color || "📡"} ${source?.name || post.source}`
+      );
+
+      try {
+        const result =
+          await sendChannel(
+            post.text,
+            post.media
+          );
+
+        const messageId =
+          result.message_id;
+
+        const now =
+          new Date().toISOString();
+
+        state.lastPost =
+          now;
+
+        state.totalPosted =
+          (state.totalPosted ||
+            0) + 1;
+
+        state.sourceStats[
+          post.source
+        ].posted =
+          (state.sourceStats[
+            post.source
+          ].posted || 0) + 1;
+
+        /*
+           Для топа 24ч.
+           Реакции позже обновляются через
+           message_reaction_count, если Telegram
+           присылает обновление боту.
+        */
+        state.posts24h[
+          String(messageId)
+        ] = {
+          messageId,
+
+          title:
+            post.title,
+
+          source:
+            post.source,
+
+          category:
+            post.category,
+
+          publishedAt:
+            now,
+
+          reactions: 0,
+        };
+
+        lastPublicationTime =
+          Date.now();
+
+        saveJSON(
+          STATE_FILE,
+          state
+        );
+
+        console.log(
+          `✅ Опубликовано: ${post.title}`
+        );
+      } catch (error) {
+        state.totalErrors =
+          (state.totalErrors ||
+            0) + 1;
+
+        state.sourceStats[
+          post.source
+        ].errors =
+          (state.sourceStats[
+            post.source
+          ].errors || 0) + 1;
+
+        saveJSON(
+          STATE_FILE,
+          state
+        );
+
+        console.error(
+          "❌ Ошибка публикации:",
+          error.message
+        );
+      }
+
+      updateAdminStatus().catch(
+        () => {}
+      );
+    }
+  } finally {
+    publisherRunning =
+      false;
+
+    if (
+      publicationQueue.length
+    ) {
+      setStage(
+        "📦 Очередь",
+        `${publicationQueue.length} новостей ожидают публикации`
+      );
+    } else {
+      setStage(
+        "🟢 Ожидание",
+        "Новых публикаций в очереди нет"
+      );
+    }
+  }
+}
+
+/* =========================================================
+   INITIAL SYNC
+========================================================= */
+
+async function initialSync() {
+  setStage(
+    "🛡 Первичная синхронизация",
+    "Запоминаю последние новости, без публикации старого архива"
+  );
+
+  for (
+    const source of FEEDS
+  ) {
+    try {
+      const feed =
+        await parser.parseURL(
+          source.url
+        );
+
+      const items =
+        feed.items.slice(
+          0,
+          5
+        );
+
+      postedData.sources[
+        source.id
+      ] = items
+        .filter(
+          (item) =>
+            item.link
+        )
+        .slice(
+          -REMEMBER_PER_SOURCE
+        )
+        .map(
+          (item) => ({
+            link:
+              item.link,
+
+            title:
+              item.title ||
+              "",
+
+            time:
+              new Date().toISOString(),
+          })
+        );
+
+      state.sourceStats[
+        source.id
+      ] = {
+        ...state.sourceStats[
+          source.id
+        ],
+
+        status:
+          "🟢 Работает",
+
+        found:
+          items.length,
+
+        lastCheck:
+          new Date().toISOString(),
+
+        lastError:
+          null,
+      };
+    } catch (error) {
+      state.sourceStats[
+        source.id
+      ] = {
+        ...state.sourceStats[
+          source.id
+        ],
+
+        status:
+          "🔴 Ошибка",
+
+        lastCheck:
+          new Date().toISOString(),
+
+        lastError:
+          error.message,
+
+        errors:
+          (state.sourceStats[
+            source.id
+          ].errors || 0) + 1,
+      };
+    }
+  }
+
+  saveJSON(
+    POSTED_FILE,
+    postedData
+  );
+
+  state.initialized =
+    true;
+
+  state.lastCheck =
+    new Date().toISOString();
+
+  saveJSON(
+    STATE_FILE,
+    state
+  );
+
+  setStage(
+    "✅ Синхронизация завершена",
+    "Теперь публикуются только новые новости"
+  );
+}
+
+/* =========================================================
+   CHECK FEEDS
+========================================================= */
+
+async function checkFeeds() {
+  if (isChecking) {
+    return;
+  }
+
+  isChecking = true;
+
+  try {
+    if (
+      !state.initialized
+    ) {
+      await initialSync();
+      return;
+    }
+
+    setStage(
+      "🔎 Поиск новостей",
+      `Проверяю ${FEEDS.length} источников`
+    );
+
+    for (
+      const source of FEEDS
+    ) {
+      setStage(
+        "📡 Проверка источника",
+        `${source.color} ${source.name}`
+      );
+
+      try {
+        const feed =
+          await parser.parseURL(
+            source.url
+          );
+
+        const items =
+          feed.items.slice(
+            0,
+            10
+          );
+
+        const stats =
+          state.sourceStats[
+            source.id
+          ];
+
+        stats.status =
+          "🟢 Работает";
+
+        stats.found =
+          items.length;
+
+        stats.lastCheck =
+          new Date().toISOString();
+
+        stats.lastError =
+          null;
+
+        /*
+           Важно:
+           сравниваем только с двумя
+           последними запомненными.
+        */
+
+        for (
+          const item of items
+        ) {
+          if (
+            !item.link ||
+            !item.title
+          ) {
+            continue;
+          }
+
+          const known =
+            (
+              postedData
+                .sources[
+                source.id
+              ] || []
+            ).some(
+              (post) =>
+                post.link ===
+                item.link
+            );
+
+          if (known) {
+            continue;
+          }
+
+          if (
+            alreadyQueued(
+              item.link
+            )
+          ) {
+            continue;
+          }
+
+          state.totalFound =
+            (state.totalFound ||
+              0) + 1;
+
+          stats.found =
+            (stats.found ||
+              0);
+
+          setStage(
+            "🆕 Новая новость",
+            `${source.color} ${source.name}: ${truncate(
+              item.title,
+              100
+            )}`
+          );
+
+          /*
+             Проверка похожести.
+          */
+
+          if (
+            similarToRecent(
+              source.id,
+              item.title
+            )
+          ) {
+            stats.skipped =
+              (stats.skipped ||
+                0) + 1;
+
+            state.totalSkipped =
+              (state.totalSkipped ||
+                0) + 1;
+
+            rememberPost(
+              source.id,
+              item
+            );
+
+            continue;
+          }
+
+          /*
+             ИИ.
+          */
+
+          setStage(
+            "🧠 Обработка ИИ",
+            `${source.color} ${source.name}`
+          );
+
+          try {
+            const ai =
+              await processWithAI(
+                item.title,
+                item.contentSnippet ||
+                  item.content ||
+                  item.title
+              );
+
+            const text =
+              buildPost({
+                title:
+                  ai.title,
+
+                summary:
+                  ai.summary,
+
+                source,
+
+                category:
+                  ai.category,
+
+                publishedAt:
+                  new Date(),
+              });
+
+            const media =
+              extractMedia(
+                item
+              );
+
+            /*
+               Запоминаем сразу,
+               чтобы один и тот же RSS item
+               не добавился снова в очередь.
+            */
+
+            rememberPost(
+              source.id,
+              item
+            );
+
+            queuePost({
+              link:
+                item.link,
+
+              title:
+                ai.title,
+
+              source:
+                source.id,
+
+              category:
+                ai.category,
+
+              text,
+
+              media,
+            });
+          } catch (error) {
+            stats.errors =
+              (stats.errors ||
+                0) + 1;
+
+            state.totalErrors =
+              (state.totalErrors ||
+                0) + 1;
+
+            console.error(
+              `❌ AI ${source.name}:`,
+              error.message
+            );
+          }
+        }
+      } catch (error) {
+        const stats =
+          state.sourceStats[
+            source.id
+          ];
+
+        stats.status =
+          "🔴 Ошибка";
+
+        stats.lastCheck =
+          new Date().toISOString();
+
+        stats.lastError =
+          error.message;
+
+        stats.errors =
+          (stats.errors ||
+            0) + 1;
+
+        state.totalErrors =
+          (state.totalErrors ||
+            0) + 1;
+
+        console.error(
+          `❌ RSS ${source.name}:`,
+          error.message
+        );
+      }
+    }
+
+    state.lastCheck =
+      new Date().toISOString();
+
+    saveJSON(
+      STATE_FILE,
+      state
+    );
+
+    if (
+      publicationQueue.length
+    ) {
+      setStage(
+        "📦 Новости в очереди",
+        `${publicationQueue.length} подготовлено к публикации`
+      );
+
+      publicationWorker();
+    } else {
+      setStage(
+        "🟢 Ожидание",
+        "Новых новостей не найдено"
+      );
+    }
+  } finally {
+    isChecking =
+      false;
+
+    saveJSON(
+      STATE_FILE,
+      state
+    );
+
+    updateAdminStatus().catch(
+      () => {}
+    );
+  }
+}
+
+/* =========================================================
+   ADMIN STATUS MESSAGE
+========================================================= */
 
 async function updateAdminStatus() {
   if (!ADMIN_CHAT_ID) {
@@ -609,7 +2349,7 @@ async function updateAdminStatus() {
 
   try {
     const text =
-      buildStatusText();
+      buildStatus();
 
     if (
       !adminStatusMessageId
@@ -626,8 +2366,8 @@ async function updateAdminStatus() {
             parse_mode:
               "HTML",
 
-            disable_web_page_preview:
-              true,
+            reply_markup:
+              mainKeyboard(),
           }
         );
 
@@ -651,355 +2391,21 @@ async function updateAdminStatus() {
         parse_mode:
           "HTML",
 
-        disable_web_page_preview:
-          true,
+        reply_markup:
+          mainKeyboard(),
       }
     );
   } catch (error) {
-    /*
-       Если сообщение невозможно отредактировать,
-       просто сбрасываем ID. Следующая попытка
-       создаст новое сообщение.
-    */
-
-    console.error(
-      "Admin status error:",
-      error.message
-    );
-
     adminStatusMessageId =
       null;
   }
 }
 
-/* =======================================================
-   ADMIN MENU
-======================================================= */
+/* =========================================================
+   ADMIN STARTUP
+========================================================= */
 
-function adminKeyboard() {
-  return {
-    inline_keyboard: [
-      [
-        {
-          text: "📊 Статус",
-          callback_data:
-            "admin_status",
-        },
-
-        {
-          text: "📡 Источники",
-          callback_data:
-            "admin_sources",
-        },
-      ],
-
-      [
-        {
-          text: "🔎 Проверить сейчас",
-          callback_data:
-            "admin_check",
-        },
-
-        {
-          text: "📈 Статистика",
-          callback_data:
-            "admin_stats",
-        },
-      ],
-
-      [
-        {
-          text: "🧩 Версия",
-          callback_data:
-            "admin_version",
-        },
-
-        {
-          text: "🔄 Обновить",
-          callback_data:
-            "admin_refresh",
-        },
-      ],
-    ],
-  };
-}
-
-async function sendAdminMenu() {
-  if (!ADMIN_CHAT_ID) {
-    return;
-  }
-
-  try {
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          `🤖 <b>AI News Bot</b>\n\n` +
-          `🧩 Версия: <code>${VERSION}</code>\n` +
-          `🟢 Бот работает.\n\n` +
-          `Выбери действие:`,
-        
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          adminKeyboard(),
-      }
-    );
-  } catch (error) {
-    console.error(
-      "Admin menu error:",
-      error.message
-    );
-  }
-}
-
-/* =======================================================
-   SOURCES
-======================================================= */
-
-function buildSourcesText() {
-  let text =
-    `📡 <b>ИСТОЧНИКИ НОВОСТЕЙ</b>\n\n`;
-
-  FEEDS.forEach(
-    (source, index) => {
-      const stats =
-        state.sourceStats[
-          source.name
-        ] || {};
-
-      text +=
-        `<b>${index + 1}. ` +
-        `${escapeHTML(
-          source.name
-        )}</b>\n`;
-
-      text +=
-        `${stats.status || "⚪ Не проверялся"}\n`;
-
-      text +=
-        `🔎 Найдено: ` +
-        `${stats.found || 0}\n`;
-
-      text +=
-        `🕐 Проверка: ` +
-        `${formatDate(
-          stats.lastCheck
-        )}\n`;
-
-      if (stats.error) {
-        text +=
-          `❌ Ошибка: ` +
-          `${escapeHTML(
-            stats.error
-          )}\n`;
-      }
-
-      text += "\n";
-    }
-  );
-
-  return text;
-}
-
-async function sendSourcesToAdmin(
-  callbackQueryId = null
-) {
-  if (!ADMIN_CHAT_ID) {
-    return;
-  }
-
-  try {
-    if (callbackQueryId) {
-      await telegram(
-        "answerCallbackQuery",
-        {
-          callback_query_id:
-            callbackQueryId,
-        }
-      );
-    }
-
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          buildSourcesText(),
-
-        parse_mode:
-          "HTML",
-
-        disable_web_page_preview:
-          true,
-
-        reply_markup:
-          adminKeyboard(),
-      }
-    );
-  } catch (error) {
-    console.error(
-      "Sources error:",
-      error.message
-    );
-  }
-}
-
-/* =======================================================
-   STATISTICS
-======================================================= */
-
-function buildStatsText() {
-  const queue =
-    publicationQueue.length;
-
-  return (
-    `📈 <b>СТАТИСТИКА</b>\n\n` +
-
-    `🧩 Версия: ` +
-    `<code>${VERSION}</code>\n\n` +
-
-    `🔎 Найдено новостей: ` +
-    `${state.totalFound || 0}\n` +
-
-    `✅ Опубликовано: ` +
-    `${state.totalPosted || 0}\n` +
-
-    `⏭ Пропущено: ` +
-    `${state.totalSkipped || 0}\n` +
-
-    `❌ Ошибок: ` +
-    `${state.totalErrors || 0}\n\n` +
-
-    `📦 В очереди: ` +
-    `${queue}\n` +
-
-    `⏱ Лимит: 1 пост / 60 сек\n\n` +
-
-    `🕐 Последняя проверка:\n` +
-    `${formatDate(
-      state.lastCheck
-    )}\n\n` +
-
-    `📤 Последняя публикация:\n` +
-    `${formatDate(
-      state.lastPost
-    )}`
-  );
-}
-
-async function sendStatsToAdmin(
-  callbackQueryId = null
-) {
-  if (!ADMIN_CHAT_ID) {
-    return;
-  }
-
-  try {
-    if (callbackQueryId) {
-      await telegram(
-        "answerCallbackQuery",
-        {
-          callback_query_id:
-            callbackQueryId,
-        }
-      );
-    }
-
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          buildStatsText(),
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          adminKeyboard(),
-      }
-    );
-  } catch (error) {
-    console.error(
-      "Stats error:",
-      error.message
-    );
-  }
-}
-
-/* =======================================================
-   VERSION
-======================================================= */
-
-async function sendVersionToAdmin(
-  callbackQueryId = null
-) {
-  if (!ADMIN_CHAT_ID) {
-    return;
-  }
-
-  try {
-    if (callbackQueryId) {
-      await telegram(
-        "answerCallbackQuery",
-        {
-          callback_query_id:
-            callbackQueryId,
-        }
-      );
-    }
-
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          `🧩 <b>ВЕРСИЯ БОТА</b>\n\n` +
-
-          `AI News Bot\n` +
-
-          `Версия: ` +
-          `<code>${VERSION}</code>\n\n` +
-
-          `🚀 Запуск:\n` +
-          `${formatDate(
-            state.startedAt
-          )}\n\n` +
-
-          `🟢 Эта версия сейчас ` +
-          `запущена на сервере.`,
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          adminKeyboard(),
-      }
-    );
-  } catch (error) {
-    console.error(
-      "Version error:",
-      error.message
-    );
-  }
-}
-
-/* =======================================================
-   STARTUP NOTIFICATION
-======================================================= */
-
-async function notifyAdminStartup() {
+async function notifyStartup() {
   if (!ADMIN_CHAT_ID) {
     return;
   }
@@ -1013,32 +2419,26 @@ async function notifyAdminStartup() {
             ADMIN_CHAT_ID,
 
           text:
-            `🚀 <b>AI NEWS BOT ЗАПУЩЕН</b>\n\n` +
+            `🚀 <b>AI NEWS BOT ОБНОВЛЁН</b>\n\n` +
 
-            `🧩 Версия: ` +
-            `<code>${VERSION}</code>\n\n` +
+            `🧩 Версия:\n` +
+            `<code>v${VERSION}</code>\n\n` +
 
-            `✅ Новая версия реально запущена.\n\n` +
+            `🟢 Сервер запущен\n` +
+            `🧠 ИИ подключён\n` +
+            `📡 Источников: ${FEEDS.length}\n` +
+            `📤 Лимит: 1 пост / минуту\n` +
+            `💾 Память: последние ${REMEMBER_PER_SOURCE} новости / источник\n` +
+            `🕐 Время: МСК\n\n` +
 
-            `📡 Источников: ` +
-            `${FEEDS.length}\n` +
-
-            `⏱ Проверка: ` +
-            `${CHECK_INTERVAL_MIN} мин\n` +
-
-            `📤 Публикация: ` +
-            `1 пост / 60 сек\n` +
-
-            `🛡 Дубли: ` +
-            `${SIMILARITY_THRESHOLD * 100}%\n\n` +
-
-            `Ниже доступно управление ботом.`,
+            `Если здесь отображается <code>v${VERSION}</code>, ` +
+            `обновление действительно прошло.`,
 
           parse_mode:
             "HTML",
 
           reply_markup:
-            adminKeyboard(),
+            mainKeyboard(),
         }
       );
 
@@ -1046,1055 +2446,368 @@ async function notifyAdminStartup() {
       result.message_id;
   } catch (error) {
     console.error(
-      "Startup notification error:",
+      "Ошибка уведомления:",
       error.message
     );
   }
 }
 
-/* =======================================================
-   DUPLICATE DETECTION
-======================================================= */
+/* =========================================================
+   CALLBACKS
+========================================================= */
 
-function normalizeWords(title) {
-  return (
-    title || ""
-  )
-    .toLowerCase()
-    .replace(
-      /[^\p{L}\p{N}\s]/gu,
-      ""
-    )
-    .split(/\s+/)
-    .filter(
-      (word) =>
-        word.length > 3
-    );
-}
-
-function jaccardSimilarity(
-  wordsA,
-  wordsB
+async function handleCallback(
+  callback
 ) {
-  const setA =
-    new Set(wordsA);
-
-  const setB =
-    new Set(wordsB);
-
-  if (
-    setA.size === 0 ||
-    setB.size === 0
-  ) {
-    return 0;
+  if (!ADMIN_CHAT_ID) {
+    return;
   }
 
-  const intersection =
-    [...setA].filter(
-      (word) =>
-        setB.has(word)
-    ).length;
+  if (
+    String(
+      callback.message?.chat
+        ?.id
+    ) !==
+    String(ADMIN_CHAT_ID)
+  ) {
+    return;
+  }
 
-  const union =
-    new Set([
-      ...setA,
-      ...setB,
-    ]).size;
+  const data =
+    callback.data;
 
-  return (
-    intersection /
-    union
+  await telegram(
+    "answerCallbackQuery",
+    {
+      callback_query_id:
+        callback.id,
+    }
   );
-}
 
-function findSimilarPosted(
-  title,
-  postedList
-) {
-  const words =
-    normalizeWords(title);
-
-  return postedList.find(
-    (post) =>
-      jaccardSimilarity(
-        words,
-        normalizeWords(
-          post.title
-        )
-      ) >=
-      SIMILARITY_THRESHOLD
-  );
-}
-
-/* =======================================================
-   GROQ
-======================================================= */
-
-const EDITOR_PROMPT =
-  "Ты редактор новостного Telegram-канала. " +
-  "Тебе дают заголовок и текст новости. " +
-  "Верни ТОЛЬКО валидный JSON без пояснений, в формате " +
-  '{"title":"заголовок на русском языке","summary":"краткий пересказ на русском, 3-5 предложений, только суть, без воды и без вымышленных фактов"}' +
-  ". Если оригинал уже на русском — немного отполируй заголовок, смысл не меняй. " +
-  "Никогда не придумывай факты.";
-
-async function summarizeAndTranslate(
-  title,
-  content
-) {
-  const response =
-    await fetch(
-      "https://api.groq.com/openai/v1/chat/completions",
+  if (data === "status") {
+    await telegram(
+      "sendMessage",
       {
-        method: "POST",
+        chat_id:
+          ADMIN_CHAT_ID,
 
-        headers: {
-          "Content-Type":
-            "application/json",
+        text:
+          buildStatus(),
 
-          Authorization:
-            `Bearer ${GROQ_API_KEY}`,
-        },
+        parse_mode:
+          "HTML",
 
-        body:
-          JSON.stringify({
-            model:
-              "openai/gpt-oss-120b",
-
-            messages: [
-              {
-                role:
-                  "system",
-
-                content:
-                  EDITOR_PROMPT,
-              },
-
-              {
-                role:
-                  "user",
-
-                content:
-                  `Заголовок: ${title}\n\n` +
-                  `Текст статьи: ${content}`,
-              },
-            ],
-
-            temperature: 0.4,
-
-            max_tokens: 500,
-
-            response_format: {
-              type:
-                "json_object",
-            },
-          }),
+        reply_markup:
+          mainKeyboard(),
       }
     );
 
-  const data =
-    await response.json();
-
-  if (
-    !data.choices ||
-    !data.choices[0]
-  ) {
-    throw new Error(
-      "Groq error: " +
-      JSON.stringify(data)
-    );
-  }
-
-  const contentText =
-    data.choices[0]
-      .message
-      .content;
-
-  const parsed =
-    JSON.parse(
-      contentText
-    );
-
-  return {
-    title:
-      parsed.title ||
-      title,
-
-    summary:
-      parsed.summary ||
-      "",
-  };
-}
-
-/* =======================================================
-   MEDIA
-======================================================= */
-
-function extractMedia(item) {
-  if (
-    item.enclosure &&
-    item.enclosure.url
-  ) {
-    const type =
-      item.enclosure.type ||
-      "";
-
-    if (
-      type.startsWith(
-        "video"
-      )
-    ) {
-      return {
-        url:
-          item.enclosure.url,
-
-        kind:
-          "video",
-      };
-    }
-
-    if (
-      type.startsWith(
-        "image"
-      )
-    ) {
-      return {
-        url:
-          item.enclosure.url,
-
-        kind:
-          "photo",
-      };
-    }
+    return;
   }
 
   if (
-    item.mediaContent &&
-    item.mediaContent.length
+    data === "sources"
   ) {
-    const media =
-      item.mediaContent[0]
-        .$ || {};
+    await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          ADMIN_CHAT_ID,
 
-    if (media.url) {
-      const type =
-        media.medium ||
-        media.type ||
-        "";
+        text:
+          buildSources(),
 
-      return {
-        url:
-          media.url,
+        parse_mode:
+          "HTML",
 
-        kind:
-          type.includes(
-            "video"
-          )
-            ? "video"
-            : "photo",
-      };
-    }
-  }
-
-  if (
-    item.mediaThumbnail &&
-    item.mediaThumbnail.length
-  ) {
-    const media =
-      item.mediaThumbnail[0]
-        .$ || {};
-
-    if (media.url) {
-      return {
-        url:
-          media.url,
-
-        kind:
-          "photo",
-      };
-    }
-  }
-
-  const html =
-    item.content ||
-    item["content:encoded"] ||
-    "";
-
-  const match =
-    html.match(
-      /<img[^>]+src="([^">]+)"/
+        reply_markup:
+          mainKeyboard(),
+      }
     );
 
-  if (match) {
-    return {
-      url:
-        match[1],
-
-      kind:
-        "photo",
-    };
-  }
-
-  return null;
-}
-
-/* =======================================================
-   CHANNEL PUBLICATION
-======================================================= */
-
-async function sendToChannel(
-  text,
-  media
-) {
-  let method =
-    "sendMessage";
-
-  let payload = {
-    chat_id:
-      CHANNEL_ID,
-
-    text,
-
-    disable_web_page_preview:
-      true,
-  };
-
-  if (
-    media &&
-    media.kind ===
-      "photo"
-  ) {
-    method =
-      "sendPhoto";
-
-    payload = {
-      chat_id:
-        CHANNEL_ID,
-
-      photo:
-        media.url,
-
-      caption:
-        text.slice(
-          0,
-          1024
-        ),
-    };
+    return;
   }
 
   if (
-    media &&
-    media.kind ===
-      "video"
+    data === "categories"
   ) {
-    method =
-      "sendVideo";
+    await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          ADMIN_CHAT_ID,
 
-    payload = {
-      chat_id:
-        CHANNEL_ID,
+        text:
+          buildCategories(),
 
-      video:
-        media.url,
+        parse_mode:
+          "HTML",
 
-      caption:
-        text.slice(
-          0,
-          1024
-        ),
-    };
-  }
-
-  try {
-    return await telegram(
-      method,
-      payload
+        reply_markup:
+          categoriesKeyboard(),
+      }
     );
-  } catch (error) {
-    /*
-       Если медиа не отправилось,
-       пробуем обычным текстом.
-    */
 
-    if (media) {
-      console.warn(
-        "⚠️ Media send failed. Fallback to text:",
-        error.message
+    return;
+  }
+
+  if (
+    data.startsWith(
+      "cat_"
+    )
+  ) {
+    const categoryId =
+      data.replace(
+        "cat_",
+        ""
       );
 
-      return await telegram(
+    if (
+      categoryId ===
+      "all"
+    ) {
+      await telegram(
         "sendMessage",
         {
           chat_id:
-            CHANNEL_ID,
+            ADMIN_CHAT_ID,
 
-          text,
+          text:
+            buildTop24(),
 
-          disable_web_page_preview:
-            true,
+          parse_mode:
+            "HTML",
+
+          reply_markup:
+            mainKeyboard(),
         }
       );
-    }
-
-    throw error;
-  }
-}
-
-/* =======================================================
-   QUEUE
-======================================================= */
-
-function isInQueue(link) {
-  return publicationQueue.some(
-    (item) =>
-      item.link === link
-  );
-}
-
-function addToQueue(news) {
-  if (
-    isInQueue(
-      news.link
-    )
-  ) {
-    return false;
-  }
-
-  publicationQueue.push(
-    news
-  );
-
-  console.log(
-    `📦 В очередь: ${news.ruTitle}`
-  );
-
-  updateAdminStatus()
-    .catch(() => {});
-
-  return true;
-}
-
-/* =======================================================
-   PUBLICATION WORKER
-======================================================= */
-
-async function publicationWorker() {
-  if (publisherRunning) {
-    return;
-  }
-
-  if (
-    publicationQueue.length === 0
-  ) {
-    return;
-  }
-
-  publisherRunning = true;
-
-  try {
-    while (
-      publicationQueue.length >
-      0
-    ) {
-      /*
-         Проверяем реальное время последней публикации.
-      */
-
-      if (lastPublicationTime) {
-        const elapsed =
-          Date.now() -
-          lastPublicationTime;
-
-        const wait =
-          POST_INTERVAL_MS -
-          elapsed;
-
-        if (wait > 0) {
-          setStage(
-            "⏳ Ожидание публикации",
-
-            `Следующая публикация через ${Math.ceil(
-              wait / 1000
-            )} сек.`
-          );
-
-          await sleep(wait);
-        }
-      }
-
-      const news =
-        publicationQueue.shift();
-
-      if (!news) {
-        continue;
-      }
-
-      setStage(
-        "📤 Публикация",
-
-        `${news.source}: ${news.ruTitle}`
-      );
-
-      try {
-        await sendToChannel(
-          news.text,
-          news.media
-        );
-
-        /*
-           Сохраняем новость только после
-           успешной отправки.
-        */
-
-        const posted =
-          loadPosted();
-
-        posted.push({
-          link:
-            news.link,
-
-          title:
-            news.originalTitle,
-
-          source:
-            news.source,
-
-          publishedAt:
-            new Date()
-              .toISOString(),
-        });
-
-        savePosted(
-          posted
-        );
-
-        state.totalPosted =
-          (state.totalPosted || 0) +
-          1;
-
-        state.lastPost =
-          new Date()
-            .toISOString();
-
-        lastPublicationTime =
-          Date.now();
-
-        saveState();
-
-        console.log(
-          `✅ Опубликовано: ${news.ruTitle}`
-        );
-      } catch (error) {
-        state.totalErrors =
-          (state.totalErrors || 0) +
-          1;
-
-        saveState();
-
-        console.error(
-          "❌ Publication error:",
-          error.message
-        );
-      }
-
-      updateAdminStatus()
-        .catch(() => {});
-    }
-  } finally {
-    publisherRunning =
-      false;
-
-    setStage(
-      "🟢 Ожидание новых новостей",
-      "Очередь пуста"
-    );
-  }
-}
-
-/* =======================================================
-   INITIALIZATION
-======================================================= */
-
-/*
-   Это критически важная функция.
-
-   При первом запуске / restart:
-   текущие новости RSS НЕ публикуются.
-
-   Они только добавляются в posted.json.
-
-   Поэтому после перезапуска бот не начинает
-   публиковать старый RSS-архив.
-*/
-
-async function initializeCurrentNews() {
-  setStage(
-    "🛡 Первичная синхронизация",
-
-    "Текущие RSS-новости будут запомнены без публикации"
-  );
-
-  const posted =
-    loadPosted();
-
-  let remembered =
-    0;
-
-  for (
-    const source of FEEDS
-  ) {
-    try {
-      const feed =
-        await parser.parseURL(
-          source.url
-        );
-
-      const items =
-        feed.items.slice(
-          0,
-          ITEMS_PER_FEED
-        );
-
-      for (
-        const item of items
-      ) {
-        if (
-          !item.link
-        ) {
-          continue;
-        }
-
-        const exists =
-          posted.some(
-            (p) =>
-              p.link ===
-              item.link
-          );
-
-        if (!exists) {
-          posted.push({
-            link:
-              item.link,
-
-            title:
-              item.title ||
-              "",
-
-            source:
-              source.name,
-
-            initializedAt:
-              new Date()
-                .toISOString(),
-
-            initialized:
-              true,
-          });
-
-          remembered++;
-        }
-      }
-
-      state.sourceStats[
-        source.name
-      ] = {
-        status:
-          "🟢 Готов",
-
-        found:
-          items.length,
-
-        lastCheck:
-          new Date()
-            .toISOString(),
-
-        error:
-          null,
-      };
-    } catch (error) {
-      state.sourceStats[
-        source.name
-      ] = {
-        status:
-          "🔴 Ошибка",
-
-        found:
-          0,
-
-        lastCheck:
-          new Date()
-            .toISOString(),
-
-        error:
-          error.message,
-      };
-
-      console.error(
-        `Initialization error ${source.name}:`,
-        error.message
-      );
-    }
-  }
-
-  savePosted(
-    posted
-  );
-
-  state.initialized =
-    true;
-
-  state.version =
-    VERSION;
-
-  state.lastCheck =
-    new Date()
-      .toISOString();
-
-  saveState();
-
-  console.log(
-    `🛡 Синхронизация завершена. Запомнено: ${remembered}`
-  );
-
-  setStage(
-    "✅ Синхронизация завершена",
-
-    `Запомнено ${remembered} текущих новостей`
-  );
-}
-
-/* =======================================================
-   CHECK FEEDS
-======================================================= */
-
-async function checkFeeds() {
-  if (isChecking) {
-    console.log(
-      "⚠️ Проверка уже выполняется."
-    );
-
-    return;
-  }
-
-  isChecking =
-    true;
-
-  try {
-    /*
-       Если состояние не инициализировано,
-       не публикуем RSS-архив.
-    */
-
-    if (!isInitialized) {
-      await initializeCurrentNews();
-
-      isInitialized =
-        true;
 
       return;
     }
 
-    setStage(
-      "🔎 Поиск новостей",
+    await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          ADMIN_CHAT_ID,
 
-      `Проверяем ${FEEDS.length} источников`
+        text:
+          buildCategoryPosts(
+            categoryId
+          ),
+
+        parse_mode:
+          "HTML",
+
+        reply_markup:
+          categoriesKeyboard(),
+      }
     );
 
-    const posted =
-      loadPosted();
+    return;
+  }
 
-    let foundThisCheck =
-      0;
+  if (
+    data === "top24"
+  ) {
+    await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          ADMIN_CHAT_ID,
 
-    for (
-      const source of FEEDS
+        text:
+          buildTop24(),
+
+        parse_mode:
+          "HTML",
+
+        reply_markup:
+          mainKeyboard(),
+      }
+    );
+
+    return;
+  }
+
+  if (
+    data === "statistics"
+  ) {
+    await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          ADMIN_CHAT_ID,
+
+        text:
+          buildStatistics(),
+
+        parse_mode:
+          "HTML",
+
+        reply_markup:
+          mainKeyboard(),
+      }
+    );
+
+    return;
+  }
+
+  if (
+    data === "queue"
+  ) {
+    await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          ADMIN_CHAT_ID,
+
+        text:
+          buildQueue(),
+
+        parse_mode:
+          "HTML",
+
+        reply_markup:
+          mainKeyboard(),
+      }
+    );
+
+    return;
+  }
+
+  if (
+    data ===
+    "toggle_posts"
+  ) {
+    state.postingEnabled =
+      !state.postingEnabled;
+
+    saveJSON(
+      STATE_FILE,
+      state
+    );
+
+    if (
+      state.postingEnabled
     ) {
       setStage(
-        "📡 Проверка источника",
-
-        source.name
+        "▶️ Публикация включена",
+        `${publicationQueue.length} новостей в очереди`
       );
 
-      try {
-        const feed =
-          await parser.parseURL(
-            source.url
-          );
-
-        const items =
-          feed.items.slice(
-            0,
-            ITEMS_PER_FEED
-          );
-
-        state.sourceStats[
-          source.name
-        ] = {
-          status:
-            "🟢 Работает",
-
-          found:
-            items.length,
-
-          lastCheck:
-            new Date()
-              .toISOString(),
-
-          error:
-            null,
-        };
-
-        for (
-          const item of items
-        ) {
-          if (
-            !item.link
-          ) {
-            continue;
-          }
-
-          /*
-             Уже опубликована или запомнена.
-          */
-
-          const alreadyKnown =
-            posted.some(
-              (p) =>
-                p.link ===
-                item.link
-            );
-
-          if (
-            alreadyKnown
-          ) {
-            continue;
-          }
-
-          /*
-             Дубликат в очереди.
-          */
-
-          if (
-            isInQueue(
-              item.link
-            )
-          ) {
-            continue;
-          }
-
-          foundThisCheck++;
-
-          state.totalFound =
-            (state.totalFound || 0) +
-            1;
-
-          setStage(
-            "🔎 Найдена новая новость",
-
-            `${source.name}: ${item.title || "Без заголовка"}`
-          );
-
-          /*
-             Проверяем похожесть заголовка.
-          */
-
-          const similar =
-            findSimilarPosted(
-              item.title ||
-                "",
-              posted
-            );
-
-          if (similar) {
-            console.log(
-              `⏭ Дубликат: "${item.title}" ≈ "${similar.title}"`
-            );
-
-            /*
-               Запоминаем ссылку,
-               чтобы больше не проверять её.
-            */
-
-            posted.push({
-              link:
-                item.link,
-
-              title:
-                item.title ||
-                "",
-
-              source:
-                source.name,
-
-              skipped:
-                true,
-
-              skippedAt:
-                new Date()
-                  .toISOString(),
-            });
-
-            state.totalSkipped =
-              (state.totalSkipped || 0) +
-              1;
-
-            continue;
-          }
-
-          /*
-             ИИ.
-          */
-
-          setStage(
-            "🧠 Обработка ИИ",
-
-            `${source.name}: ${item.title || ""}`
-          );
-
-          try {
-            const result =
-              await summarizeAndTranslate(
-                item.title ||
-                  "",
-
-                item.contentSnippet ||
-                  item.content ||
-                  item.title ||
-                  ""
-              );
-
-            const text =
-              `📰 ${result.title}\n\n` +
-              `${result.summary}\n\n` +
-              `Источник: ${source.name}`;
-
-            const media =
-              extractMedia(
-                item
-              );
-
-            addToQueue({
-              link:
-                item.link,
-
-              originalTitle:
-                item.title ||
-                "",
-
-              ruTitle:
-                result.title,
-
-              source:
-                source.name,
-
-              text,
-
-              media,
-            });
-
-            console.log(
-              `📦 Добавлено в очередь: ${result.title}`
-            );
-          } catch (error) {
-            state.totalErrors =
-              (state.totalErrors || 0) +
-              1;
-
-            console.error(
-              `❌ AI error ${source.name}:`,
-              error.message
-            );
-          }
-        }
-      } catch (error) {
-        state.totalErrors =
-          (state.totalErrors || 0) +
-          1;
-
-        state.sourceStats[
-          source.name
-        ] = {
-          status:
-            "🔴 Ошибка",
-
-          found:
-            0,
-
-          lastCheck:
-            new Date()
-              .toISOString(),
-
-          error:
-            error.message,
-        };
-
-        console.error(
-          `❌ RSS error ${source.name}:`,
-          error.message
-        );
-      }
+      publicationWorker();
+    } else {
+      setStage(
+        "⛔ Публикация остановлена",
+        "Новые новости продолжают собираться"
+      );
     }
 
-    savePosted(
-      posted
+    await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          ADMIN_CHAT_ID,
+
+        text:
+          state.postingEnabled
+            ? `▶️ <b>ПУБЛИКАЦИЯ ВКЛЮЧЕНА</b>\n\nОчередь: ${publicationQueue.length}`
+            : `⛔ <b>ПУБЛИКАЦИЯ ОСТАНОВЛЕНА</b>\n\nНовости продолжают проверяться и попадать в очередь.`,
+
+        parse_mode:
+          "HTML",
+
+        reply_markup:
+          mainKeyboard(),
+      }
     );
 
-    state.lastCheck =
-      new Date()
-        .toISOString();
+    return;
+  }
 
-    saveState();
+  if (
+    data === "version"
+  ) {
+    await sendVersion();
+    return;
+  }
 
-    setStage(
-      "📦 Новости готовы к публикации",
+  if (
+    data === "settings"
+  ) {
+    await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          ADMIN_CHAT_ID,
 
-      `Новых: ${foundThisCheck}. В очереди: ${publicationQueue.length}`
+        text:
+          buildSettings(),
+
+        parse_mode:
+          "HTML",
+
+        reply_markup:
+          mainKeyboard(),
+      }
     );
 
-    /*
-       Запускаем worker.
-       Он сам выдерживает 60 секунд между постами.
-    */
+    return;
+  }
 
-    publicationWorker()
-      .catch(
-        (error) => {
-          console.error(
-            "Publisher fatal error:",
-            error.message
-          );
-        }
-      );
-  } catch (error) {
-    state.totalErrors =
-      (state.totalErrors || 0) +
-      1;
+  if (
+    data === "refresh"
+  ) {
+    await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          ADMIN_CHAT_ID,
 
-    saveState();
+        text:
+          `🔄 <b>Проверка запущена</b>\n\n` +
+          `Смотри раздел «Статус», чтобы видеть текущий этап.`,
 
-    console.error(
-      "❌ checkFeeds error:",
-      error.message
+        parse_mode:
+          "HTML",
+
+        reply_markup:
+          mainKeyboard(),
+      }
     );
 
-    setStage(
-      "🔴 Ошибка проверки",
-      error.message
+    checkFeeds();
+
+    return;
+  }
+
+  if (
+    data === "back"
+  ) {
+    await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          ADMIN_CHAT_ID,
+
+        text:
+          `🤖 <b>AI NEWS BOT</b>\n\nВыбери раздел:`,
+
+        parse_mode:
+          "HTML",
+
+        reply_markup:
+          mainKeyboard(),
+      }
     );
-  } finally {
-    isChecking =
-      false;
-
-    saveState();
-
-    updateAdminStatus()
-      .catch(() => {});
   }
 }
 
-/* =======================================================
+/* =========================================================
    ADMIN COMMANDS
-======================================================= */
+========================================================= */
 
 async function handleAdminMessage(
   message
@@ -2107,9 +2820,7 @@ async function handleAdminMessage(
     String(
       message.chat.id
     ) !==
-    String(
-      ADMIN_CHAT_ID
-    )
+    String(ADMIN_CHAT_ID)
   ) {
     return;
   }
@@ -2119,34 +2830,9 @@ async function handleAdminMessage(
       message.text || ""
     ).trim();
 
-  if (!text) {
-    return;
-  }
-
-  const command =
-    text
-      .split(/\s+/)[0]
-      .toLowerCase();
-
   if (
-    command ===
-    "/start"
-  ) {
-    await sendAdminMenu();
-    return;
-  }
-
-  if (
-    command ===
-    "/menu"
-  ) {
-    await sendAdminMenu();
-    return;
-  }
-
-  if (
-    command ===
-    "/status"
+    text === "/start" ||
+    text === "/menu"
   ) {
     await telegram(
       "sendMessage",
@@ -2155,13 +2841,13 @@ async function handleAdminMessage(
           ADMIN_CHAT_ID,
 
         text:
-          buildStatusText(),
+          `🤖 <b>AI NEWS BOT v${VERSION}</b>\n\nВыбери раздел:`,
 
         parse_mode:
           "HTML",
 
         reply_markup:
-          adminKeyboard(),
+          mainKeyboard(),
       }
     );
 
@@ -2169,68 +2855,10 @@ async function handleAdminMessage(
   }
 
   if (
-    command ===
-    "/sources"
+    text === "/check"
   ) {
-    await sendSourcesToAdmin();
-    return;
-  }
-
-  if (
-    command ===
-    "/version"
-  ) {
-    await sendVersionToAdmin();
-    return;
-  }
-
-  if (
-    command ===
-    "/stats"
-  ) {
-    await sendStatsToAdmin();
-    return;
-  }
-
-  if (
-    command ===
-    "/check"
-  ) {
-    if (isChecking) {
-      await telegram(
-        "sendMessage",
-        {
-          chat_id:
-            ADMIN_CHAT_ID,
-
-          text:
-            "⚠️ Проверка уже выполняется.",
-        }
-      );
-
-      return;
-    }
-
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          "🔎 Проверка новостей запущена.",
-      }
-    );
-
     checkFeeds();
 
-    return;
-  }
-
-  if (
-    command ===
-    "/help"
-  ) {
     await telegram(
       "sendMessage",
       {
@@ -2238,192 +2866,91 @@ async function handleAdminMessage(
           ADMIN_CHAT_ID,
 
         text:
-          `🤖 <b>AI News Bot</b>\n\n` +
-
-          `/menu — главное меню\n` +
-          `/status — текущий этап\n` +
-          `/sources — источники\n` +
-          `/version — версия\n` +
-          `/stats — статистика\n` +
-          `/check — проверить сейчас\n` +
-          `/help — помощь`,
-
-        parse_mode:
-          "HTML",
+          "🔎 Проверка запущена.",
 
         reply_markup:
-          adminKeyboard(),
+          mainKeyboard(),
       }
     );
-
-    return;
   }
 }
 
-/* =======================================================
-   CALLBACK BUTTONS
-======================================================= */
+/* =========================================================
+   REACTIONS
+========================================================= */
 
-async function handleCallbackQuery(
-  callback
+/*
+   Telegram может присылать message_reaction_count
+   для сообщений канала.
+
+   Мы ищем соответствующий message_id
+   среди опубликованных за последние 24 часа.
+*/
+
+function totalReactions(
+  reactionArray
 ) {
-  if (!ADMIN_CHAT_ID) {
-    return;
-  }
-
-  const message =
-    callback.message;
-
-  if (!message) {
-    return;
-  }
-
   if (
-    String(
-      message.chat.id
-    ) !==
-    String(
-      ADMIN_CHAT_ID
+    !Array.isArray(
+      reactionArray
     )
   ) {
-    return;
+    return 0;
   }
 
+  return reactionArray.reduce(
+    (sum, reaction) =>
+      sum +
+      Number(
+        reaction.total_count ||
+          0
+      ),
+    0
+  );
+}
+
+function handleReactionUpdate(
+  update
+) {
   const data =
-    callback.data;
+    update.message_reaction_count;
 
-  if (
-    data ===
-    "admin_status"
-  ) {
-    await telegram(
-      "answerCallbackQuery",
-      {
-        callback_query_id:
-          callback.id,
-      }
-    );
-
-    await telegram(
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_CHAT_ID,
-
-        text:
-          buildStatusText(),
-
-        parse_mode:
-          "HTML",
-
-        reply_markup:
-          adminKeyboard(),
-      }
-    );
-
+  if (!data) {
     return;
   }
 
-  if (
-    data ===
-    "admin_sources"
-  ) {
-    await sendSourcesToAdmin(
-      callback.id
+  const messageId =
+    String(
+      data.message_id
     );
 
-    return;
-  }
-
   if (
-    data ===
-    "admin_stats"
+    state.posts24h[
+      messageId
+    ]
   ) {
-    await sendStatsToAdmin(
-      callback.id
-    );
-
-    return;
-  }
-
-  if (
-    data ===
-    "admin_version"
-  ) {
-    await sendVersionToAdmin(
-      callback.id
-    );
-
-    return;
-  }
-
-  if (
-    data ===
-    "admin_refresh"
-  ) {
-    await telegram(
-      "answerCallbackQuery",
-      {
-        callback_query_id:
-          callback.id,
-
-        text:
-          "🔄 Статус обновлён",
-      }
-    );
-
-    await sendAdminMenu();
-
-    return;
-  }
-
-  if (
-    data ===
-    "admin_check"
-  ) {
-    if (isChecking) {
-      await telegram(
-        "answerCallbackQuery",
-        {
-          callback_query_id:
-            callback.id,
-
-          text:
-            "⚠️ Проверка уже выполняется",
-        }
+    state.posts24h[
+      messageId
+    ].reactions =
+      totalReactions(
+        data.reactions
       );
 
-      return;
-    }
-
-    await telegram(
-      "answerCallbackQuery",
-      {
-        callback_query_id:
-          callback.id,
-
-        text:
-          "🔎 Проверка запущена",
-      }
+    saveJSON(
+      STATE_FILE,
+      state
     );
-
-    checkFeeds();
-
-    return;
   }
 }
 
-/* =======================================================
+/* =========================================================
    TELEGRAM POLLING
-======================================================= */
+========================================================= */
 
-async function adminPollingLoop() {
-  if (!ADMIN_CHAT_ID) {
-    return;
-  }
-
+async function adminPolling() {
   if (
-    adminPollingRunning
+    adminPollingRunning ||
+    !BOT_TOKEN
   ) {
     return;
   }
@@ -2431,46 +2958,37 @@ async function adminPollingLoop() {
   adminPollingRunning =
     true;
 
-  console.log(
-    "📨 Telegram admin polling запущен"
-  );
-
   /*
-     При старте берём только новые update.
-     Старые команды из очереди не выполняем.
+     Получаем последний update,
+     чтобы не обрабатывать старые команды.
   */
 
   try {
-    const pending =
+    const updates =
       await telegram(
         "getUpdates",
         {
-          offset:
-            -1,
-
-          limit:
-            1,
-
-          timeout:
-            1,
+          offset: -1,
+          limit: 1,
+          timeout: 1,
+          allowed_updates: [
+            "message",
+            "callback_query",
+            "message_reaction_count",
+          ],
         }
       );
 
     if (
-      pending &&
-      pending.length
+      updates &&
+      updates.length
     ) {
       telegramUpdateOffset =
-        pending[
-          pending.length - 1
+        updates[
+          updates.length - 1
         ].update_id;
     }
-  } catch (error) {
-    console.warn(
-      "⚠️ Не удалось очистить старые Telegram updates:",
-      error.message
-    );
-  }
+  } catch {}
 
   while (true) {
     try {
@@ -2479,59 +2997,77 @@ async function adminPollingLoop() {
           "getUpdates",
           {
             offset:
-              telegramUpdateOffset + 1,
+              telegramUpdateOffset +
+              1,
 
-            timeout:
-              25,
+            timeout: 25,
 
             allowed_updates: [
               "message",
               "callback_query",
+              "message_reaction_count",
             ],
           }
         );
 
-      if (
-        updates &&
-        updates.length
+      for (
+        const update of
+          updates || []
       ) {
-        for (
-          const update of updates
+        telegramUpdateOffset =
+          update.update_id;
+
+        if (
+          update.message
         ) {
-          telegramUpdateOffset =
-            update.update_id;
-
-          if (
+          await handleAdminMessage(
             update.message
-          ) {
-            await handleAdminMessage(
-              update.message
-            );
-          }
+          );
+        }
 
-          if (
+        if (
+          update.callback_query
+        ) {
+          await handleCallback(
             update.callback_query
-          ) {
-            await handleCallbackQuery(
-              update.callback_query
-            );
-          }
+          );
+        }
+
+        if (
+          update.message_reaction_count
+        ) {
+          handleReactionUpdate(
+            update
+          );
         }
       }
     } catch (error) {
       console.error(
-        "Telegram polling error:",
+        "Telegram polling:",
         error.message
       );
 
-      await sleep(5000);
+      await sleep(
+        5000
+      );
     }
   }
 }
 
-/* =======================================================
-   HTTP ROUTES
-======================================================= */
+/* =========================================================
+   CLEAN TOP
+========================================================= */
+
+setInterval(
+  () => {
+    clean24h();
+  },
+  10 * 60 * 1000
+);
+
+/* =========================================================
+   HTTP
+========================================================= */
 
 app.get(
   "/",
@@ -2549,29 +3085,39 @@ app.get(
       version:
         VERSION,
 
+      postingEnabled:
+        state.postingEnabled,
+
       checking:
         isChecking,
 
       stage:
-        lastStage,
+        state.currentStage,
 
       details:
-        lastStageDetails,
+        state.currentDetails,
 
       queue:
         publicationQueue.length,
 
+      sources:
+        FEEDS.length,
+
       totalFound:
-        state.totalFound || 0,
+        state.totalFound ||
+        0,
 
       totalPosted:
-        state.totalPosted || 0,
+        state.totalPosted ||
+        0,
 
       totalSkipped:
-        state.totalSkipped || 0,
+        state.totalSkipped ||
+        0,
 
       totalErrors:
-        state.totalErrors || 0,
+        state.totalErrors ||
+        0,
 
       lastCheck:
         state.lastCheck,
@@ -2588,15 +3134,22 @@ app.get(
     res.json(
       FEEDS.map(
         (source) => ({
+          id:
+            source.id,
+
           name:
             source.name,
+
+          color:
+            source.color,
 
           url:
             source.url,
 
-          ...(state.sourceStats[
-            source.name
-          ] || {}),
+          stats:
+            state.sourceStats[
+              source.id
+            ],
         })
       )
     );
@@ -2605,7 +3158,7 @@ app.get(
 
 app.get(
   "/run-now",
-  async (req, res) => {
+  (req, res) => {
     if (
       RUN_SECRET &&
       req.query.secret !==
@@ -2627,96 +3180,80 @@ app.get(
     checkFeeds();
 
     res.send(
-      "Проверка запущена. Смотри статус в ЛС."
+      `Проверка запущена. AI News Bot v${VERSION}`
     );
   }
 );
 
-/* =======================================================
-   SERVER START
-======================================================= */
+/* =========================================================
+   START
+========================================================= */
 
 const PORT =
-  process.env.PORT ||
-  3000;
+  process.env.PORT || 3000;
 
 app.listen(
   PORT,
-  () => {
+  async () => {
     console.log(
-      "========================================"
+      "======================================"
     );
 
     console.log(
-      `🤖 AI News Bot v${VERSION}`
+      `🤖 AI NEWS BOT v${VERSION}`
     );
 
     console.log(
-      `📡 Источников: ${FEEDS.length}`
+      `📡 Sources: ${FEEDS.length}`
     );
 
     console.log(
-      "📤 Лимит: 1 публикация / 60 секунд"
+      "📤 Limit: 1 post / 60 sec"
     );
 
     console.log(
-      `⏱ Проверка RSS: каждые ${CHECK_INTERVAL_MIN} минут`
+      `🕐 Timezone: ${TIMEZONE}`
     );
 
     console.log(
-      "========================================"
+      `💾 Remember: ${REMEMBER_PER_SOURCE} per source`
+    );
+
+    console.log(
+      "======================================"
+    );
+
+    await notifyStartup();
+
+    setStage(
+      "🚀 Запуск",
+      `AI News Bot v${VERSION}`
     );
 
     /*
-       Запуск приложения.
+       Сначала синхронизация,
+       затем проверка.
     */
 
-    (async () => {
-      try {
-        await notifyAdminStartup();
+    await checkFeeds();
 
-        setStage(
-          "🚀 Бот запущен",
-          `Версия ${VERSION}`
-        );
+    /*
+       Telegram управление.
+    */
 
-        /*
-           ВАЖНО:
-           если state.initialized === false,
-           первая проверка только синхронизирует RSS.
-        */
+    adminPolling();
 
-        await checkFeeds();
+    /*
+       Регулярная проверка.
+    */
 
-        /*
-           Telegram админ-команды.
-        */
-
-        adminPollingLoop();
-
-        /*
-           Регулярная проверка RSS.
-        */
-
-        setInterval(
-          () => {
-            checkFeeds();
-          },
-          CHECK_INTERVAL_MIN *
-            60 *
-            1000
-        );
-      } catch (error) {
-        console.error(
-          "❌ Fatal startup error:",
-          error
-        );
-
-        setStage(
-          "🔴 Критическая ошибка",
-          error.message
-        );
-      }
-    })();
+    setInterval(
+      () => {
+        checkFeeds();
+      },
+      CHECK_INTERVAL_MIN *
+        60 *
+        1000
+    );
   }
 );
