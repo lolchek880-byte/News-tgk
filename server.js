@@ -7,10 +7,10 @@ const path = require("path");
 const app = express();
 
 /* =========================================================
-   AI NEWS BOT v0.9.1
+   AI NEWS BOT v0.5.1
 ========================================================= */
 
-const VERSION = "0.5.2";
+const VERSION = "0.5.3";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
@@ -354,6 +354,19 @@ function truncate(value, max) {
 }
 
 function moscowDate(date = new Date()) {
+  /* Раньше сюда часто передавали ISO-строку (state.lastCheck и т.п.)
+     вместо объекта Date. Intl.DateTimeFormat.format() не умеет сам
+     превращать строку в дату и падает с "Invalid time value".
+     Это и было настоящей причиной падения кнопок "Статус"/"Источники". */
+  const safeDate =
+    date instanceof Date
+      ? date
+      : new Date(date);
+
+  if (isNaN(safeDate.getTime())) {
+    return "—";
+  }
+
   return new Intl.DateTimeFormat(
     "ru-RU",
     {
@@ -366,10 +379,19 @@ function moscowDate(date = new Date()) {
       second: "2-digit",
       hour12: false,
     }
-  ).format(date);
+  ).format(safeDate);
 }
 
 function moscowTime(date = new Date()) {
+  const safeDate =
+    date instanceof Date
+      ? date
+      : new Date(date);
+
+  if (isNaN(safeDate.getTime())) {
+    return "—";
+  }
+
   return new Intl.DateTimeFormat(
     "ru-RU",
     {
@@ -378,7 +400,7 @@ function moscowTime(date = new Date()) {
       minute: "2-digit",
       hour12: false,
     }
-  ).format(date);
+  ).format(safeDate);
 }
 
 function sourceById(id) {
